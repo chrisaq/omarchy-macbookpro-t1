@@ -80,3 +80,5 @@ this repository. GPL-2.0-only; upstream driver credit is retained. Audio source 
 fetched from its pinned upstream revision, and no Apple firmware is distributed.
 
 Boot checksum warnings and scripted repair: [BOOT-INTEGRITY.md](docs/BOOT-INTEGRITY.md).
+
+Known lid/suspend failure and staged Touch Bar callback repair: [SUSPEND.md](docs/SUSPEND.md).

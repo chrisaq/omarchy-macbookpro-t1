@@ -222,3 +222,7 @@ Do not conclude that a better displayed RSSI alone proves better RF performance.
 After kernel/firmware updates, run the integrity/status checks and verify both
 supported bands and actual connectivity. Checksum validation does not establish
 that a changed driver selected this override or that new kernel behavior is correct.
+
+A subsequent suspend attempt failed the Wi-Fi D3 handshake and left Wi-Fi
+unusable. See [SUSPEND.md](SUSPEND.md); the NVRAM improvement does not solve this
+power-management failure.
