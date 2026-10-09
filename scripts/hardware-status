@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Read-only hardware inventory. Detection is never a functional pass."""
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+
+COMPONENTS = ('display', 'graphics', 'wifi', 'bluetooth', 'keyboard', 'trackpad',
+              'keyboard-backlight', 'touchbar', 'speakers', 'microphone', 'headphones',
+              'webcam', 'ambient-light', 'temperatures', 'fans', 'battery',
+              'suspend', 'usb-c', 'external-display', 'thunderbolt', 'macos-boot', 'cold-boot')
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+def run(args):
+    try:
+        p = subprocess.run(args, text=True, capture_output=True, timeout=12)
+        return {'available': True, 'returncode': p.returncode, 'stdout': p.stdout.strip(),
+                'error': p.stderr.strip() if p.returncode else ''}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {'available': False, 'error': type(exc).__name__}
+
+def observation_status(observations, tests, kernel):
+    result = {}
+    for component in COMPONENTS:
+        history = tests.get(component, [])
+        latest = history[-1] if history else None
+        if latest and latest['kernel'] == kernel:
+            status = 'user-verified' if latest['result'] == 'passed' else latest['result']
+        elif latest:
+            status = 'previous-kernel-test'
+        else:
+            status = 'detected' if observations.get(component) else 'untested'
+        result[component] = {'status': status, 'observation': observations.get(component), 'latest_test': latest}
+    return result
+
+def collect(results=None):
+    kernel = platform.release()
+    modules = {}
+    for name in ('apple_ibridge', 'apple_ib_tb', 'applespi', 'applesmc', 'i915', 'brcmfmac', 'uvcvideo', 'btusb', 'snd_hda_codec_cs8409'):
+        directory = Path('/sys/module') / name
+        modules[name] = {'present': directory.exists(), 'initstate': read(directory / 'initstate')}
+    hid = []
+    controls = []
+    for dev in Path('/sys/bus/hid/devices').glob('*:05AC:8600.*'):
+        driver = dev / 'driver'
+        hid.append({'id': dev.name, 'driver': driver.resolve().name if driver.exists() else None})
+        if (dev / 'fnmode').exists():
+            controls.append({name: read(dev / name) for name in ('fnmode', 'idle_timeout', 'dim_timeout')})
+    t1 = []
+    for dev in Path('/sys/bus/usb/devices').glob('*'):
+        if read(dev / 'idVendor') == '05ac' and read(dev / 'idProduct') in ('8600', '1281'):
+            t1.append({'product': read(dev / 'idProduct'), 'configuration': read(dev / 'bConfigurationValue')})
+    batteries = []
+    for dev in Path('/sys/class/power_supply').glob('*'):
+        if read(dev / 'type') == 'Battery':
+            batteries.append({name: read(dev / name) for name in ('status', 'capacity', 'energy_now', 'energy_full', 'energy_full_design')})
+    sensors = []
+    for dev in Path('/sys/class/hwmon').glob('*'):
+        sensor = {'name': read(dev / 'name')}
+        sensor['temperatures_millidegrees_c'] = [read(p) for p in sorted(dev.glob('temp*_input'))]
+        sensor['fan_rpm'] = [read(p) for p in sorted(dev.glob('fan*_input'))]
+        sensors.append(sensor)
+    observations = {
+        'graphics': modules['i915']['present'], 'wifi': modules['brcmfmac']['present'],
+        'keyboard': modules['applespi']['present'], 'trackpad': modules['applespi']['present'],
+        'speakers': modules['snd_hda_codec_cs8409']['present'], 'webcam': modules['uvcvideo']['present'],
+        'bluetooth': bool(list(Path('/sys/class/bluetooth').glob('hci*'))),
+        'touchbar': bool(controls), 'battery': bool(batteries), 'temperatures': bool(sensors),
+        'fans': any(item['fan_rpm'] for item in sensors),
+        'keyboard-backlight': bool(list(Path('/sys/class/leds').glob('*kbd_backlight*'))),
+        'display': any(read(p / 'status') == 'connected' for p in Path('/sys/class/drm').glob('card*-*')),
+    }
+    tests = json.loads(Path(results).read_text()) if results and Path(results).exists() else {}
+    return {'generated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'model': read('/sys/class/dmi/id/product_name'), 'kernel': kernel,
+            'os_release': {line.split('=', 1)[0]: line.split('=', 1)[1].strip('"') for line in (read('/etc/os-release') or '').splitlines() if '=' in line},
+            'dkms': run(['dkms', 'status']), 'audio_module': run(['modinfo', '-F', 'filename', 'snd-hda-codec-cs8409']),
+            'audio_vermagic': run(['modinfo', '-F', 'vermagic', 'snd-hda-codec-cs8409']),
+            'modules': modules, 't1_usb': t1, 't1_hid': hid, 'touchbar_controls': controls,
+            'batteries': batteries, 'sensors': sensors,
+            'components': observation_status(observations, tests, kernel)}
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--json', action='store_true', help='Print machine-readable output')
+    parser.add_argument('--results', default='results.json', help='Local functional test record')
+    args = parser.parse_args()
+    report = collect(args.results)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"{report['model']} · {report['kernel']}")
+        print('Detection is not functional verification; run docs/VERIFY.md tests.')
+        for name, item in report['components'].items():
+            print(f"{name:20} {item['status']}")
+        print('DKMS:', report['dkms'].get('stdout', report['dkms'].get('error')))
+    return 0 if report['model'] == 'MacBookPro13,2' else 2
+
+if __name__ == '__main__':
+    raise SystemExit(main())

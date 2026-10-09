@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Check the recorded Omarchy UKI hash; optionally rebuild through Limine."""
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+
+IMAGE = "EFI/Linux/omarchy_linux-omarchy.efi"
+
+def inspect(boot):
+    config = boot / "limine.conf"
+    image = boot / IMAGE
+    references = []
+    for line in config.read_text().splitlines():
+        match = re.fullmatch(r"\s*path\s*:\s*boot\(\):/" + re.escape(IMAGE) + r"(?:#([^\s]+))?\s*", line, re.IGNORECASE)
+        if match:
+            references.append(match.group(1))
+    if not references:
+        raise RuntimeError("No matching UKI path in limine.conf; this layout needs separate investigation.")
+    with image.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "blake2b").hexdigest()
+    valid = all(value and re.fullmatch(r"[0-9a-fA-F]{128}", value) and value.lower() == digest for value in references)
+    print(f"UKI: {image}")
+    print(f"Actual BLAKE2b-512: {digest}")
+    for value in references:
+        print(f"Recorded: {value or '(missing verification hash)'}")
+    print("PASS: all matching UKI references agree." if valid else "FAIL: UKI hash is missing, malformed or mismatched.")
+    return valid
+
+def repair(boot):
+    if os.geteuid() != 0:
+        raise RuntimeError("Repair requires sudo.")
+    if boot != Path("/boot"):
+        raise RuntimeError("Repair supports only the recorded /boot layout.")
+    if Path("/sys/class/dmi/id/product_name").read_text().strip() != "MacBookPro13,2":
+        raise RuntimeError("Repair supports only MacBookPro13,2.")
+    target = subprocess.check_output(["findmnt", "-n", "-o", "TARGET", "--target", str(boot)], text=True).strip()
+    if target != str(boot):
+        raise RuntimeError("/boot must be its own mounted boot filesystem.")
+    for tool in ("limine-mkinitcpio", "pacman", "objcopy"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"Missing prerequisite: {tool}")
+    listing = subprocess.check_output(["pacman", "-Ql", "linux-omarchy"], text=True)
+    kernels = re.findall(r" /usr/lib/modules/([^/]+)/modules\.builtin$", listing, re.MULTILINE)
+    if len(kernels) != 1:
+        raise RuntimeError("Cannot identify exactly one installed linux-omarchy kernel.")
+    # Inspect before modifying: unsupported layouts and inaccessible files stop here.
+    inspect(boot)
+    base = Path("/var/lib/macbookpro13-2-omarchy/boot-backups")
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"), dir=base))
+    shutil.copy2(boot / "limine.conf", backup / "limine.conf")
+    shutil.copy2(boot / IMAGE, backup / Path(IMAGE).name)
+    print(f"Backup: {backup}", flush=True)
+    # Supported targeted builder also updates the entry and invokes host boot hooks.
+    # Its current shell implementation can swallow a build failure; check the log,
+    # resulting image's kernel release, and hash instead of trusting exit status.
+    result = subprocess.run(["limine-mkinitcpio", "linux-omarchy"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    (backup / "rebuild.log").write_text(result.stdout)
+    print(result.stdout, end="", flush=True)
+    if result.returncode or re.search(r"(?:\bERROR\b|mkinitcpio failed)", result.stdout, re.IGNORECASE):
+        raise RuntimeError("Rebuild reported an error; keep the backup and investigate before rebooting.")
+    with tempfile.TemporaryDirectory(prefix="uki-uname-") as work:
+        section = Path(work) / "uname"
+        # Always supply an output image: objcopy with input alone can rewrite it.
+        subprocess.run(["objcopy", "--dump-section", f".uname={section}", str(boot / IMAGE), str(Path(work) / "copy.efi")], check=True)
+        release = section.read_bytes().rstrip(b"\0\n").decode()
+    if release != kernels[0]:
+        raise RuntimeError("Resulting UKI does not contain the installed linux-omarchy kernel.")
+    if not inspect(boot):
+        raise RuntimeError("Post-rebuild hash verification failed; investigate before rebooting.")
+    print("Rebuilt and verified. No reboot or running-driver reload occurred. Confirm the normal entry at the next boot.")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repair", action="store_true", help="back up and rebuild the installed linux-omarchy UKI and entry")
+    parser.add_argument("--boot-root", type=Path, default=Path("/boot"), help="alternate fixture root for read-only checks")
+    args = parser.parse_args()
+    try:
+        if args.repair:
+            repair(args.boot_root)
+            return 0
+        return 0 if inspect(args.boot_root) else 1
+    except (OSError, RuntimeError, subprocess.SubprocessError, UnicodeError) as error:
+        print(f"STOP: {error}")
+        return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())

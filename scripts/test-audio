@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Explicit short PipeWire playback/recording tests; no mixer changes."""
+import argparse
+import math
+import os
+from pathlib import Path
+import shutil
+import signal
+import struct
+import subprocess
+import tempfile
+import wave
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('test', choices=('speakers', 'microphone', 'headphones'))
+parser.add_argument('--target', required=True, help='Explicit PipeWire sink/source node ID from wpctl status')
+parser.add_argument('--output', default='reports/microphone.wav', help='Local private microphone recording')
+args = parser.parse_args()
+command = 'pw-record' if args.test == 'microphone' else 'pw-play'
+if not shutil.which(command):
+    parser.error(f'{command} is missing; install pipewire-audio.')
+if not args.target.isdigit():
+    parser.error('Use a numeric PipeWire node ID.')
+if args.test == 'microphone':
+    os.umask(0o077)
+    output = Path(args.output)
+    if output.exists():
+        parser.error('Output already exists; choose another path.')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    print('Recording for 8 seconds. Speak into the selected microphone.')
+    process = subprocess.Popen(['pw-record', '--target', args.target, str(output)])
+    try:
+        code = process.wait(timeout=8)
+        if code:
+            raise SystemExit(code)
+    except subprocess.TimeoutExpired:
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill(); process.wait()
+            raise SystemExit('Recorder did not exit cleanly.')
+    if not output.exists() or output.stat().st_size <= 44:
+        raise SystemExit('No recording data produced.')
+    os.chmod(output, 0o600)
+    print(f'Recorded {output}. Listen to it on a selected output; only clear speech is a functional pass.')
+else:
+    print('Use a low desktop volume. A quiet tone plays left, then right; no direct ALSA device is used.')
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'channels.wav'
+        rate = 48000
+        with wave.open(str(path), 'wb') as audio:
+            audio.setnchannels(2); audio.setsampwidth(2); audio.setframerate(rate)
+            frames = bytearray()
+            for i in range(rate * 4):
+                channel = 0 if i < rate * 2 else 1
+                tone = int(2000 * math.sin(2 * math.pi * 440 * i / rate))
+                frames.extend(struct.pack('<hh', tone if channel == 0 else 0, tone if channel == 1 else 0))
+            audio.writeframes(frames)
+        subprocess.run(['pw-play', '--target', args.target, str(path)], check=True)
+    print('Playback completed. Confirm what you heard before recording a pass.')

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+fail() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+[[ $EUID -eq 0 ]] || fail 'Run with sudo after preparing and reviewing the source.'
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || fail 'Unsupported model.'
+kernel=${1:-$(uname -r)}
+[[ $# -le 1 && $kernel != */* && $kernel != -* ]] || fail 'Usage: install-audio [kernel-release]'
+[[ -d /usr/lib/modules/$kernel/build/include ]] || fail 'Matching headers missing.'
+[[ $(printf '%s\n' 6.17 "${kernel%%-*}" | sort -V | head -n 1) == 6.17 ]] || fail 'This checked audio recipe requires kernel 6.17 or newer.'
+for tool in dkms wget patch make gcc; do command -v "$tool" >/dev/null || fail "Missing prerequisite: $tool"; done
+source="$root/build/snd_hda_macbookpro-0.1"
+[[ -f $source/UPSTREAM-COMMIT ]] || fail 'Run scripts/prepare-audio first.'
+[[ $(cat "$source/UPSTREAM-COMMIT") == 89b22ff90b86468b186706861dd18663562defa7 ]] || fail 'Unexpected source revision.'
+# A fresh-install path: do not silently replace an existing working audio driver.
+[[ ! -e /usr/src/snd_hda_macbookpro-0.1 && ! -L /usr/src/snd_hda_macbookpro-0.1 ]] || fail 'Existing audio source; follow migration notes instead.'
+[[ -z $(dkms status -m snd_hda_macbookpro) ]] || fail 'Audio driver already registered; preserve the working installation.'
+cp -a "$source" /usr/src/snd_hda_macbookpro-0.1
+chown -R root:root /usr/src/snd_hda_macbookpro-0.1
+dkms add -m snd_hda_macbookpro -v 0.1
+dkms build -m snd_hda_macbookpro -v 0.1 -k "$kernel"
+dkms install -m snd_hda_macbookpro -v 0.1 -k "$kernel"
+path=$(modinfo -k "$kernel" -n snd-hda-codec-cs8409)
+[[ $path == */updates/dkms/* ]] || fail "Unexpected installed module path: $path"
+[[ $(modinfo -k "$kernel" -F vermagic snd-hda-codec-cs8409) == "$kernel "* ]] || fail 'Module kernel mismatch.'
+if [[ $(cat "/usr/lib/modules/$kernel/pkgbase") == linux-omarchy ]]; then
+    "$root/scripts/boot-integrity" --repair
+else
+    printf 'Non-Omarchy kernel: synchronize its boot image using the distribution tooling before reboot.\n'
+fi
+printf 'Installed for %s. No live module was reloaded and no reboot was requested.\n' "$kernel"
+printf 'Follow docs/AUDIO.md: reboot when ready, then perform audible playback tests.\n'

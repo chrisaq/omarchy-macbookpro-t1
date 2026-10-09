@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+commit=89b22ff90b86468b186706861dd18663562defa7
+checkout=${1:-$root/build/audio-upstream}
+output="$root/build/snd_hda_macbookpro-0.1"
+[[ $# -le 1 ]] || { echo 'Usage: prepare-audio [existing-upstream-checkout]' >&2; exit 2; }
+[[ ! -e $output ]] || { echo "Staging already exists: $output. Inspect or move it before preparing again." >&2; exit 1; }
+if [[ ! -d $checkout/.git ]]; then
+    [[ $# -eq 0 ]] || { echo 'Supplied path is not a Git checkout.' >&2; exit 1; }
+    mkdir -p "$root/build"
+    git clone https://github.com/davidjo/snd_hda_macbookpro.git "$checkout"
+fi
+git -C "$checkout" cat-file -e "$commit^{commit}"
+mkdir -p "$output"
+git -C "$checkout" archive "$commit" | tar -x -C "$output"
+patch --directory="$output" -p1 < "$root/patches/audio-dkms-target-kernel.patch"
+install -m 755 "$root/scripts/audio-pre-build-checked.sh" "$output/pre-build-checked.sh"
+printf '%s\n' "$commit" > "$output/UPSTREAM-COMMIT"
+printf 'Prepared pinned, patched source: %s\nNo system files changed.\n' "$output"

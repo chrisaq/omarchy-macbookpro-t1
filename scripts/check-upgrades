@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -uo pipefail
+errors=0
+bad() { printf 'FAIL: %s\n' "$*" >&2; errors=$((errors+1)); }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || bad 'Unsupported model.'
+shopt -s nullglob
+kernels=()
+for directory in /usr/lib/modules/*; do
+    [[ -d $directory/kernel ]] && kernels+=("${directory##*/}")
+done
+[[ ${#kernels[@]} -gt 0 ]] || bad 'No installed kernel trees.'
+for kernel in "${kernels[@]}"; do
+    [[ -d /usr/lib/modules/$kernel/build/include ]] || bad "Headers missing: $kernel"
+    for driver in appleibridge snd_hda_macbookpro; do
+        state=$(dkms status -m "$driver" -v 0.1 -k "$kernel")
+        [[ $state == *': installed'* ]] || bad "$driver not installed for $kernel"
+    done
+    for module in apple-ibridge apple-ib-tb snd-hda-codec-cs8409; do
+        file=$(modinfo -k "$kernel" -n "$module" 2>/dev/null) || { bad "$module missing for $kernel"; continue; }
+        [[ $file == */updates/dkms/* ]] || bad "Unexpected module path: $file"
+        [[ $(modinfo -k "$kernel" -F vermagic "$module") == "$kernel "* ]] || bad "Module kernel mismatch: $module"
+    done
+    printf 'Checked installed kernel: %s\n' "$kernel"
+done
+if command -v apple-t1-touchbar-check >/dev/null; then
+    apple-t1-touchbar-check --all || bad 'Touch Bar package check failed.'
+else
+    printf 'NOTE: Touch Bar package check unavailable; manual installation may be in use.\n'
+fi
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+"$root/scripts/boot-integrity" || bad 'Boot verification failed or could not be read; run this check with sudo.'
+"$root/scripts/wifi" check --boot --if-installed || bad 'Wi-Fi candidate or early-boot verification failed.'
+[[ $errors -eq 0 ]] || exit 1
+printf 'PASS: installed builds. Repeat functional checks after booting the upgraded kernel.\n'
