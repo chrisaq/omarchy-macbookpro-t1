@@ -28,6 +28,10 @@ class WiFiTests(unittest.TestCase):
             stack.enter_context(patch.object(wifi, key, value))
         for name in ('require_hardware', 'boot_check', 'deploy_helpers'):
             stack.enter_context(patch.object(wifi, name))
+        # The pacman ownership probe is host-dependent. Stub it as "not owned" so
+        # the suite is hermetic and gives the same result on non-Arch CI runners
+        # instead of dying on a missing pacman binary.
+        stack.enter_context(patch.object(wifi, 'package_owns', return_value=False))
         stack.enter_context(patch.object(wifi, 'lock', side_effect=nullcontext))
         stack.enter_context(patch.object(wifi, 'inspect_initramfs', return_value=False))
         return target, wifi.personalize(TEMPLATE, MAC)
@@ -103,6 +107,26 @@ class WiFiTests(unittest.TestCase):
             wifi.install(argparse.Namespace(command='adopt'))
             self.assertEqual(target.stat().st_mtime_ns, timestamp)
             self.assertTrue(json.loads(wifi.RECORD.read_text())['adopted'])
+
+    def test_adoption_refuses_a_package_owned_file(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            target, data = self.fixture(folder, stack)
+            target.write_bytes(data)
+            stack.enter_context(patch.object(wifi, 'package_owns', return_value=True))
+            with self.assertRaises(RuntimeError):
+                wifi.install(argparse.Namespace(command='adopt'))
+            self.assertFalse(wifi.RECORD.exists())
+
+    def test_adoption_fails_closed_when_ownership_cannot_be_determined(self):
+        # Missing pacman means "unknown", and unknown must not be read as "not
+        # owned": adopting an unaccounted file invites a silent package overwrite.
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            target, data = self.fixture(folder, stack)
+            target.write_bytes(data)
+            stack.enter_context(patch.object(wifi, 'package_owns', side_effect=RuntimeError('pacman is unavailable')))
+            with self.assertRaises(RuntimeError):
+                wifi.install(argparse.Namespace(command='adopt'))
+            self.assertFalse(wifi.RECORD.exists())
 
     def test_early_wifi_installs_dropin_and_uses_supported_rebuild(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:

@@ -1,9 +1,35 @@
 name: Check guides and scripts
 on: [push, pull_request]
+
 jobs:
   checks:
     runs-on: ubuntu-latest
+
+    # Arch container instead of the ubuntu-latest host.
+    #
+    # Every script in this repo targets Arch and shells out to pacman. On an
+    # Ubuntu runner those code paths cannot run at all, so CI could only ever
+    # crash on them rather than actually exercise them - which is exactly how a
+    # FileNotFoundError: 'pacman' from the adopt ownership probe reached main
+    # while passing locally on Arch.
+    #
+    # Pinned by digest because Arch is rolling: an unrelated upstream package
+    # change should not be able to turn this job red. Bump deliberately with:
+    #   docker pull archlinux:base-devel
+    #   docker inspect --format '{{index .RepoDigests 0}}' archlinux:base-devel
+    # (tag for reference: archlinux:base-devel)
+    container:
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+
     steps:
+      # base-devel ships python3, pacman, make and gcc but NOT git or shellcheck.
+      # git has to be installed before actions/checkout, which needs it and runs
+      # before any later step could provide it.
+      # -Syu rather than -Sy: a plain -Sy is the partial-upgrade anti-pattern.
+      - name: Install CI prerequisites
+        run: pacman -Syu --noconfirm git shellcheck
+
       - uses: actions/checkout@v4
+
       - run: python3 -m unittest discover -s tests -v
       - run: shellcheck scripts/prepare-audio scripts/install-audio scripts/check-upgrades scripts/test-webcam scripts/audio-pre-build-checked.sh scripts/suspend-status scripts/suspend-test scripts/install-suspend scripts/disable-suspend

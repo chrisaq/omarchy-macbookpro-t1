@@ -110,9 +110,11 @@ if [[ $mode == s2idle-tb-cycle ]]; then
     done
 fi
 rescan_tb() {
-    local pass address
+    local address
+    # Two passes with a one second settle; the counter itself is never read, so it
+    # is named _ rather than suppressed.
     # Rescan these root ports only: never the Wi-Fi or NVMe endpoint.
-    for pass in 1 2; do
+    for _ in 1 2; do
         for address in 0000:00:1c.4 0000:00:1d.0; do
             printf '1\n' > "/sys/bus/pci/devices/$address/rescan" || return 1
         done
