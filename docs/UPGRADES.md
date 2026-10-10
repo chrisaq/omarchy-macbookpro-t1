@@ -1,7 +1,7 @@
 # Upgrades, boot verification and recovery
 
 Use Omarchy's normal full-system update process. Keep each installed kernel's
-matching headers. Arch DKMS hooks rebuild registered audio/Touch Bar source when
+matching headers. Arch DKMS hooks rebuild registered audio/Touch Bar/Wi-Fi resume source when
 kernels and source packages change; `AUTOINSTALL=yes` alone does not guarantee a
 future source patch will compile or hardware will function.
 
@@ -59,6 +59,12 @@ sudo ./scripts/boot-integrity --repair
 
 ## Wi-Fi maintenance
 
+The [Wi-Fi resume DKMS guide](WIFI-RESUME.md) covers package installation,
+migration, failed rebuilds and stock rollback. Its package hook runs after DKMS
+and UKI hooks. Run `sudo mbp13-2-wifi-resume-check --all` before rebooting after
+upgrades; `check-upgrades` also invokes it when installed. A failed pacman hook
+does not undo the transaction.
+
 See [WIFI.md](WIFI.md) for the persistent pacman check hook, adoption of an existing
 working candidate, scripted rollback and `wifi sync-boot` when early firmware
 needs refreshing. The hook validates rather than silently replacing files.
@@ -79,3 +85,5 @@ Apple recovery procedure. This guide contains no disk-wiping or firmware-restora
 script. MacOS boot selection and firmware backup verification remain separate tasks;
 the historical Limine mismatch was repaired and the user confirmed the warning
 was gone after reboot.
+
+Wi-Fi suspend firmware reprobe now has a [DKMS package, migration and rollback guide](WIFI-RESUME.md). Kernel upgrades require matching headers and successful checks before reboot.

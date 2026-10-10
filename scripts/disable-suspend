@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+[[ $EUID == 0 && $# == 0 ]] || { echo 'Usage: sudo scripts/disable-suspend' >&2; exit 1; }
+record=/var/lib/macbookpro13-2-omarchy/suspend-installed.sha256
+[[ -f $record ]] || { echo 'No installation record; inspect manually.' >&2; exit 1; }
+sha256sum -c "$record"
+if systemctl is-active --quiet systemd-suspend.service; then
+    echo 'Suspend is active; refusing to change its dependencies.' >&2; exit 1
+fi
+/usr/local/lib/macbookpro13-2-omarchy/suspend-guard restore
+systemctl disable macbookpro13-2-suspend.service
+systemctl stop macbookpro13-2-suspend.service
+rm -- /etc/systemd/sleep.conf.d/zz-macbookpro13-2.conf /etc/systemd/system/macbookpro13-2-suspend.service /usr/local/lib/macbookpro13-2-omarchy/suspend-guard "$record"
+systemctl daemon-reload
+echo 'Removed only recorded suspend policy/service/helper. No UKI change or driver reload occurred.'
+echo 'Suspend now uses the prior policy again; its deep-sleep failure is not fixed by this rollback.'

@@ -226,3 +226,5 @@ that a changed driver selected this override or that new kernel behavior is corr
 A subsequent suspend attempt failed the Wi-Fi D3 handshake and left Wi-Fi
 unusable. See [SUSPEND.md](SUSPEND.md); the NVRAM improvement does not solve this
 power-management failure.
+
+Wi-Fi suspend firmware reprobe now has a [DKMS package, migration and rollback guide](WIFI-RESUME.md). Kernel upgrades require matching headers and successful checks before reboot.

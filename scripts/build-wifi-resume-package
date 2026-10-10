@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import runpy
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+
+def main():
+    if os.geteuid() == 0 or len(sys.argv) != 1:
+        raise RuntimeError('Run scripts/build-wifi-resume-package without sudo')
+    metadata = runpy.run_path(str(ROOT / 'scripts/build-wifi-resume'))
+    output = ROOT / 'build/wifi-resume-package'
+    output.mkdir(parents=True, exist_ok=False)
+    archive = ROOT / 'build/linux-7.2.5.tar.xz'
+    if not archive.exists():
+        partial = archive.with_suffix('.part')
+        print('Downloading pinned kernel archive...', flush=True)
+        with urllib.request.urlopen('https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.5.tar.xz', timeout=60) as src, partial.open('wb') as dst:
+            shutil.copyfileobj(src, dst)
+        partial.replace(archive)
+    digest = hashlib.blake2b()
+    with archive.open('rb') as src:
+        while data := src.read(1024*1024):
+            digest.update(data)
+    if digest.hexdigest() != metadata['DIGEST']:
+        raise RuntimeError('Kernel archive checksum mismatch')
+    work = output / 'source-work'
+    prefix = 'linux-7.2.5/drivers/net/wireless/broadcom/brcm80211/'
+    print('Verified source; preparing source-only DKMS package...', flush=True)
+    with tarfile.open(archive, 'r:xz') as tar:
+        for member in tar:
+            if not member.name.startswith(prefix) or not member.isfile():
+                continue
+            relative = PurePosixPath(member.name[len(prefix):])
+            if '..' in relative.parts or relative.is_absolute():
+                raise RuntimeError('Unsafe archive path')
+            # Only brcmfmac and common include files; no unrelated driver source.
+            if relative.parts[0] not in ('brcmfmac', 'include', 'Makefile', 'Kconfig'):
+                continue
+            target = work.joinpath(*PurePosixPath(member.name).parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(tar.extractfile(member).read())
+    patch = ROOT / 'patches/brcmfmac-mbp13-2-cold-resume.patch'
+    subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-d', str(work), '-i', str(patch)], check=True)
+    driver = work / 'drivers/net/wireless/broadcom/brcm80211'
+    provenance = {'kernel_source':'7.2.5', 'source_blake2b':metadata['DIGEST'],
+                  'patch_sha256':hashlib.sha256(patch.read_bytes()).hexdigest(),
+                  'recipe_commit':metadata['COMMIT']}
+    import json
+    (driver / 'PROVENANCE.json').write_text(json.dumps(provenance, indent=2)+'\n')
+    with tarfile.open(output / 'driver-source.tar.gz', 'w:gz') as tar:
+        tar.add(driver, arcname='driver-source')
+    packaging = ROOT / 'packaging/wifi-resume'
+    for name in ('dkms.conf', 'check', '99-mbp13-2-brcmfmac-check.hook'):
+        shutil.copyfile(packaging / name, output / name)
+    shutil.copyfile(ROOT / 'scripts/boot-integrity', output / 'boot-integrity')
+    shutil.copyfile(ROOT / 'LICENSE', output / 'LICENSE')
+    names = ['driver-source.tar.gz','dkms.conf','check','boot-integrity','99-mbp13-2-brcmfmac-check.hook','LICENSE']
+    sums = ' '.join("'"+hashlib.sha256((output / name).read_bytes()).hexdigest()+"'" for name in names)
+    (output / 'PKGBUILD').write_text((packaging / 'PKGBUILD').read_text().replace('__SOURCE_CHECKSUMS__', sums))
+    subprocess.run(['makepkg', '--nodeps', '--noconfirm'], cwd=output, check=True)
+    packages = list(output.glob('mbp13-2-brcmfmac-dkms-*.pkg.tar.zst'))
+    if len(packages) != 1:
+        raise RuntimeError('Expected exactly one generated package')
+    package = packages[0]
+    (output / 'PACKAGE.sha256').write_text(hashlib.sha256(package.read_bytes()).hexdigest()+'  '+package.name+'\n')
+    print('Built package: '+str(package))
+    print('No package installation, driver reload, UKI change or reboot occurred.')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print('STOP: '+str(error), file=sys.stderr)
+        sys.exit(1)

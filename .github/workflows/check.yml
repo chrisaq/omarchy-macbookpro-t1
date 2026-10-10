@@ -6,4 +6,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m unittest discover -s tests -v
-      - run: shellcheck scripts/prepare-audio scripts/install-audio scripts/check-upgrades scripts/test-webcam scripts/audio-pre-build-checked.sh scripts/suspend-status
+      - run: shellcheck scripts/prepare-audio scripts/install-audio scripts/check-upgrades scripts/test-webcam scripts/audio-pre-build-checked.sh scripts/suspend-status scripts/suspend-test scripts/install-suspend scripts/disable-suspend

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Guarded Thunderbolt preparation/restoration for systemd suspend only."""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import subprocess
+import time
+
+PCI = Path('/sys/bus/pci/devices')
+ROOTS = {'0000:00:1c.4': '9d14', '0000:00:1d.0': '9d18'}
+SPECS = dict((f'0000:{address}', device) for address, device in (
+    ('00:1c.4', '9d14'), ('00:1d.0', '9d18'), ('03:00.0', '1578'),
+    ('04:00.0', '15d3'), ('04:01.0', '15d3'), ('04:02.0', '15d3'), ('04:04.0', '15d3'),
+    ('05:00.0', '15d2'), ('06:00.0', '15d4'), ('79:00.0', '1578'),
+    ('7a:00.0', '15d3'), ('7a:01.0', '15d3'), ('7a:02.0', '15d3'), ('7a:04.0', '15d3'),
+    ('7b:00.0', '15d2'), ('7c:00.0', '15d4')))
+TREES = ('0000:03:00.0', '0000:79:00.0')
+DRIVERS = {'0000:05:00.0': 'thunderbolt', '0000:06:00.0': 'xhci_hcd',
+           '0000:7b:00.0': 'thunderbolt', '0000:7c:00.0': 'xhci_hcd'}
+MARKER = Path('/run/macbookpro13-2-suspend/pending')
+
+
+def verify_ids(specs):
+    for address, device in specs.items():
+        path = PCI / address
+        if not path.exists() or (path / 'vendor').read_text().strip() != '0x8086' or (path / 'device').read_text().strip() != '0x' + device:
+            raise RuntimeError(f'Missing/unexpected controller {address}; reboot or investigate before suspend.')
+
+
+def check():
+    verify_ids(SPECS)
+    for tree, root in zip(TREES, ROOTS):
+        if (PCI / tree).resolve().parent != (PCI / root).resolve():
+            raise RuntimeError('Unexpected Thunderbolt ancestry.')
+    roots = [(PCI / address).resolve() for address in ROOTS]
+    trees = [(PCI / address).resolve() for address in TREES]
+    for endpoint in PCI.iterdir():
+        if any(endpoint.resolve().is_relative_to(root) for root in roots) and endpoint.name not in SPECS:
+            raise RuntimeError(f'Unexpected/attached PCI endpoint {endpoint.name}; sleep refused.')
+    for endpoint in Path('/sys/class/block').iterdir():
+        if any(endpoint.resolve().is_relative_to(tree) for tree in trees):
+            raise RuntimeError('Storage under Thunderbolt; sleep refused, including unmounted storage.')
+    for endpoint in Path('/sys/bus/usb/devices').iterdir():
+        if any(endpoint.resolve().is_relative_to(tree) for tree in trees):
+            name = endpoint.name.split(':')[0]
+            if '-' in name and name.split('-', 1)[1].split('.', 1)[0] != '0':
+                raise RuntimeError('USB peripheral under Thunderbolt; disconnect it before suspend.')
+    print('PASS: complete internal controller topology; no attached peripheral/storage.', flush=True)
+
+
+def restore():
+    if not MARKER.exists():
+        return
+    verify_ids(ROOTS)
+    for _ in range(2):
+        for address in ROOTS:
+            (PCI / address / 'rescan').write_text('1\n')
+        time.sleep(1)
+    subprocess.run(['udevadm', 'settle', '--timeout=10'], check=True)
+    verify_ids(SPECS)
+    for address, driver in DRIVERS.items():
+        if (PCI / address / 'driver').resolve().name != driver:
+            raise RuntimeError(f'Controller {address} did not bind to {driver}; reboot/investigate.')
+    MARKER.unlink()
+    print('Restored all Thunderbolt/USB controllers and expected drivers.', flush=True)
+
+
+def prepare():
+    if MARKER.exists():
+        raise RuntimeError('Pending restoration from an earlier attempt; run restore or reboot first.')
+    check()
+    MARKER.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Marker precedes any removal so ExecStopPost can recover a partial start.
+    MARKER.write_text('Thunderbolt subtree restoration required\n')
+    for address in TREES:
+        (PCI / address / 'remove').write_text('1\n')
+    if any((PCI / address).exists() for address in TREES):
+        raise RuntimeError('Removal incomplete; refusing suspend.')
+    print('Prepared both Thunderbolt subtrees; Wi-Fi/NVMe/T1 untouched.', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('check', 'prepare', 'restore'))
+    args = parser.parse_args()
+    try:
+        if os.geteuid() != 0:
+            raise RuntimeError('Run with sudo.')
+        if Path('/sys/class/dmi/id/product_name').read_text().strip() != 'MacBookPro13,2':
+            raise RuntimeError('Unsupported model.')
+        with open('/run/lock/macbookpro13-2-suspend-guard.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            globals()[args.action]()
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'STOP: {error}', flush=True)
+        return 1
+
+if __name__ == '__main__':
+    raise SystemExit(main())

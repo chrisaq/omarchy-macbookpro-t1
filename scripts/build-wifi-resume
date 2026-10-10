@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Build an experimental, pinned brcmfmac module without installing it."""
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import uuid
+import tarfile
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+RELEASE = '7.2.5-3-omarchy'
+COMMIT = '7b11c97603dd9d751d803746560ee51640709725'
+DIGEST = '48551bee71cd02815136fb8abe7da4464c2e17c89ef35cb0c0530c8b969fe12127ca97ab6c656ea8e5b29f2c4a8fe4cc143a626f4cca6b972a8105991e4c6905'
+
+def run(*args):
+    subprocess.run(args, check=True)
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def main():
+    if os.geteuid() == 0 or len(sys.argv) > 2:
+        raise RuntimeError('Run without sudo: scripts/build-wifi-resume [linux-7.2.5.tar.xz]')
+    if os.uname().release != RELEASE:
+        raise RuntimeError('Candidate pinned to ' + RELEASE)
+    recipe = ROOT / 'build/wifi-resume-recipe'
+    if (recipe / 'UPSTREAM-COMMIT').read_text().strip() != COMMIT:
+        raise RuntimeError('Unexpected recipe commit')
+    text = (recipe / 'PKGBUILD').read_text()
+    if not all(re.search(pattern, text, re.M) for pattern in [r'^pkgver=7\.2\.5$', r'^pkgrel=3$', r"^b2sums=\('" + DIGEST + "'"]):
+        raise RuntimeError('Recipe version/source checksum changed')
+    # Refuse a vendor patch touching this subtree rather than silently omitting it.
+    for patch in recipe.glob('*.patch'):
+        if 'drivers/net/wireless/broadcom/brcm80211/' in patch.read_text(errors='replace'):
+            raise RuntimeError('Vendor Broadcom changes require review: ' + patch.name)
+    headers = Path('/usr/lib/modules') / RELEASE / 'build'
+    if (headers / 'include/config/kernel.release').read_text().strip() != RELEASE:
+        raise RuntimeError('Header release mismatch')
+    header_digest = sha(headers / 'Module.symvers')
+    archive = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else ROOT / 'build/linux-7.2.5.tar.xz'
+    if not archive.exists():
+        if len(sys.argv) == 2:
+            raise RuntimeError('Supplied archive missing')
+        partial = archive.with_suffix('.part')
+        print('Downloading pinned kernel archive (no installation)...', flush=True)
+        with urllib.request.urlopen('https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.5.tar.xz', timeout=60) as src, partial.open('wb') as dst:
+            while data := src.read(1024 * 1024):
+                dst.write(data)
+        partial.replace(archive)
+    digest = hashlib.blake2b()
+    with archive.open('rb') as src:
+        while data := src.read(1024 * 1024):
+            digest.update(data)
+    if digest.hexdigest() != DIGEST:
+        raise RuntimeError('Kernel archive checksum mismatch; no extraction/build')
+    stage = ROOT / 'build/wifi-resume-candidate'
+    if stage.exists():
+        if (stage / 'BUILD-RECORD.json').exists():
+            raise RuntimeError('Completed candidate preserved; inspect it before rebuilding')
+        backup = stage.with_name('wifi-resume-failed-' + uuid.uuid4().hex[:10])
+        stage.rename(backup)
+        print('Preserved incomplete attempt: ' + str(backup), flush=True)
+    stage.mkdir(exist_ok=False)
+    prefix = 'linux-7.2.5/drivers/net/wireless/broadcom/brcm80211/'
+    print('Verified source checksum; extracting Broadcom source only...', flush=True)
+    with tarfile.open(archive, 'r:xz') as tar:
+        for member in tar:
+            if not member.name.startswith(prefix):
+                continue
+            parts = PurePosixPath(member.name).parts
+            if '..' in parts or member.name.startswith('/'):
+                raise RuntimeError('Unsafe archive path')
+            target = stage.joinpath(*parts[1:])
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tar.extractfile(member).read())
+            else:
+                raise RuntimeError('Unexpected special entry: ' + member.name)
+    patch = ROOT / 'patches/brcmfmac-mbp13-2-cold-resume.patch'
+    run('patch', '--batch', '--fuzz=0', '-p1', '-d', str(stage), '-i', str(patch))
+    driver = stage / 'drivers/net/wireless/broadcom/brcm80211'
+    # Use the parent Makefile to retain upstream DEBUG flags and trace includes.
+    # brcmutil and brcmsmac remain the installed stock modules.
+    run('make', '-C', str(headers), 'M=' + str(driver),
+        'CONFIG_BRCMUTIL=', 'CONFIG_BRCMSMAC=', '-j' + str(min(os.cpu_count() or 1, 4)), 'modules')
+    module = driver / 'brcmfmac/brcmfmac.ko'
+    vermagic = subprocess.check_output(['modinfo', '-F', 'vermagic', str(module)], text=True).strip()
+    if vermagic.split()[0] != RELEASE or sha(headers / 'Module.symvers') != header_digest:
+        raise RuntimeError('Module/header verification failed')
+    record = {'kernel': RELEASE, 'recipe_commit': COMMIT, 'source_blake2b': DIGEST,
+              'patch_sha256': sha(patch), 'module_sha256': sha(module),
+              'module_symvers_sha256': header_digest, 'module': str(module), 'vermagic': vermagic}
+    (stage / 'BUILD-RECORD.json').write_text(json.dumps(record, indent=2) + '\n')
+    print('Built candidate: ' + str(module))
+    print('Build record: ' + str(stage / 'BUILD-RECORD.json'))
+    print('No module installation, driver reload, UKI change or reboot occurred.')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print('STOP: ' + str(error), file=sys.stderr)
+        sys.exit(1)

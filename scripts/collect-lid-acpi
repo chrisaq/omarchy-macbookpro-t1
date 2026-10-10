@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copy only ACPI executable tables for offline inspection; never load tables.
+set -euo pipefail
+[[ $EUID == 0 && $# == 0 ]] || { echo 'Usage: sudo scripts/collect-lid-acpi' >&2; exit 1; }
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || { echo 'Unsupported model.' >&2; exit 1; }
+[[ ${SUDO_UID:-} =~ ^[0-9]+$ && ${SUDO_GID:-} =~ ^[0-9]+$ ]] || { echo 'Run through sudo from your regular account.' >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+[[ -d $root/reports && ! -L $root/reports ]] || { echo 'Expected real checkout reports directory.' >&2; exit 1; }
+umask 077
+report=$(mktemp -d "$root/reports/lid-acpi-XXXXXXXX")
+for table in /sys/firmware/acpi/tables/DSDT /sys/firmware/acpi/tables/SSDT*; do
+    [[ -f $table ]] || continue
+    cat "$table" > "$report/${table##*/}.aml"
+done
+[[ -s $report/DSDT.aml ]] || { echo 'DSDT capture failed.' >&2; exit 1; }
+cat /proc/acpi/wakeup > "$report/wakeup.txt"
+cat /sys/module/acpi/parameters/ec_no_wakeup > "$report/ec-no-wakeup.txt"
+sha256sum "$report"/*.aml > "$report/SHA256SUMS"
+chown "$SUDO_UID:$SUDO_GID" "$report" "$report"/*
+printf 'Private ACPI capture: %s\n' "$report"
+printf 'Copied DSDT/SSDT tables only; no suspend, wake setting, firmware or UKI change.\n'

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Read-only report after a failed suspend; omit SSIDs, MACs and kernel cmdline.
+set -uo pipefail
+printf 'Kernel: %s\n' "$(uname -r)"
+for file in /sys/power/mem_sleep /sys/power/state; do
+    printf '%s: ' "$file"; cat "$file"
+done
+printf '\nWi-Fi PCI state:\n'
+for field in vendor device subsystem_vendor subsystem_device d3cold_allowed power/control power/runtime_status power/wakeup; do
+    path="/sys/bus/pci/devices/0000:02:00.0/$field"
+    [[ ! -r $path ]] || { printf '%s: ' "$field"; cat "$path"; }
+done
+printf 'Wi-Fi driver: %s\n' "$(basename -- "$(readlink -f /sys/bus/pci/devices/0000:02:00.0/driver)")"
+command -v nmcli >/dev/null && nmcli -t -f STATE general
+printf '\nTouch Bar state:\n'
+for name in apple_ibridge apple_ib_tb apple_ib_als; do
+    path="/sys/module/$name/initstate"
+    [[ ! -r $path ]] || { printf '%s: ' "$name"; cat "$path"; }
+done
+shopt -s nullglob
+for hid in /sys/bus/hid/devices/*:05AC:8600.*; do
+    printf '%s -> %s\n' "${hid##*/}" "$(basename -- "$(readlink -f "$hid/driver")")"
+    for field in fnmode idle_timeout dim_timeout; do
+        [[ ! -r $hid/$field ]] || { printf '%s: ' "$field"; cat "$hid/$field"; }
+    done
+done
+printf '\nConfigured sleep settings:\n'
+for path in /etc/systemd/sleep.conf /etc/systemd/sleep.conf.d/*.conf /usr/lib/systemd/sleep.conf.d/*.conf; do
+    [[ ! -r $path ]] || rg -H '^\s*(MemorySleepMode|SuspendState|AllowSuspend)\s*=' "$path" || true
+done
+printf '\nExisting sleep hook filenames:\n'
+for path in /usr/lib/systemd/system-sleep/* /etc/systemd/system-sleep/*; do printf '%s\n' "$path"; done
+printf '\nRelevant kernel events (last 100 matching lines):\n'
+dmesg | rg 'PM:.*(suspend|failed|Some devices)|brcmf.*(enter_D3|commonring)|Touchbar (suspended|resumed)|SOCW.*failed' | tail -n 100

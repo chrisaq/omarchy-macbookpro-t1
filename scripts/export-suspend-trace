@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copy a private saved trace into the ignored checkout for offline inspection.
+set -euo pipefail
+[[ $EUID == 0 && $# == 1 ]] || { echo 'Usage: sudo scripts/export-suspend-trace /var/lib/.../report' >&2; exit 1; }
+[[ ${SUDO_UID:-} =~ ^[0-9]+$ && ${SUDO_GID:-} =~ ^[0-9]+$ ]] || { echo 'Run through sudo from your regular account.' >&2; exit 1; }
+source_dir=$(realpath -- "$1")
+base=/var/lib/macbookpro13-2-omarchy/suspend-reports
+[[ ${source_dir%/*} == "$base" && -f $source_dir/lid-trace.txt ]] || { echo 'Expected a saved lid trace report.' >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+[[ -d $root/reports && ! -L $root/reports ]] || { echo 'Expected a real checkout reports directory.' >&2; exit 1; }
+umask 077
+output=$(mktemp -d "$root/reports/suspend-trace-XXXXXXXX")
+for file in lid-trace.txt trace-stats.txt trace-clock.txt before-wakeup.txt after-wakeup.txt restored-wakeup.txt lid-kernel.log lid-services.log; do
+    [[ -f $source_dir/$file && ! -L $source_dir/$file ]] || continue
+    cat "$source_dir/$file" > "$output/$file"
+done
+chown "$SUDO_UID:$SUDO_GID" "$output" "$output"/*
+printf 'Private offline trace copy: %s\n' "$output"
+printf 'Original report preserved; no suspend or system setting change.\n'

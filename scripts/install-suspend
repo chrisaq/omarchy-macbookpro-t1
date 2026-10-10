@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+fail() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+[[ $EUID == 0 && $# == 0 ]] || fail 'Usage: sudo scripts/install-suspend'
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || fail 'Unsupported model.'
+rg -q '\.resume = appletb_reset_resume,' /usr/src/appleibridge-0.1/apple-ib-tb.c || fail 'Install the Touch Bar resume callback repair first.'
+"$root/scripts/suspend-guard" check
+"$root/scripts/boot-integrity"
+helper=/usr/local/lib/macbookpro13-2-omarchy/suspend-guard
+unit=/etc/systemd/system/macbookpro13-2-suspend.service
+config=/etc/systemd/sleep.conf.d/zz-macbookpro13-2.conf
+for path in "$helper" "$unit" "$config" /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256; do
+    [[ ! -e $path && ! -L $path ]] || fail "Existing persistence file: $path; preserve and review it first."
+done
+# Refuse conflicting explicit policies rather than overwriting another setup.
+if systemd-analyze cat-config systemd/sleep.conf | rg -q '^\s*(MemorySleepMode|SuspendState)\s*='; then
+    fail 'An explicit sleep policy exists; review it before installing this policy.'
+fi
+backup=$(mktemp -d /var/lib/macbookpro13-2-suspend-install-XXXXXX)
+chmod 700 "$backup"
+sha256sum /boot/EFI/Linux/omarchy_linux-omarchy.efi > "$backup/uki.sha256"
+printf 'Installation record: %s\n' "$backup"
+trap 'printf "Installation stopped; preserve the record and use scripts/disable-suspend to remove recorded files if needed.\n" >&2' ERR
+install -Dm755 "$root/scripts/suspend-guard" "$helper"
+install -Dm644 "$root/systemd/macbookpro13-2-suspend.service" "$unit"
+install -Dm644 "$root/packaging/macbookpro13-2-sleep.conf" "$config"
+install -d -m 700 /var/lib/macbookpro13-2-omarchy
+# Save exact installed inputs for later integrity checks and recovery.
+sha256sum "$helper" "$unit" "$config" > "$backup/installed.sha256"
+install -m 600 "$backup/installed.sha256" /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256
+systemctl daemon-reload
+systemctl enable macbookpro13-2-suspend.service
+sha256sum -c "$backup/uki.sha256"
+"$root/scripts/boot-integrity"
+printf 'Installed and enabled. No suspend, driver reload or UKI change occurred.\n'
+printf 'Next: save work, disconnect peripherals and test systemctl suspend, then lid wake.\n'

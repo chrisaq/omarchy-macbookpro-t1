@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Observe a user-triggered lid cycle; optionally test temporary EC wake policy.
+set -euo pipefail
+fail() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+[[ $EUID == 0 && ( $# == 0 || ( $# == 1 && ( $1 == --ec-wake || $1 == --trace || $1 == --trace-check ) ) ) ]] || fail 'Usage: sudo scripts/test-lid-wake [--ec-wake|--trace|--trace-check]'
+ec_test=${1:-}
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || fail 'Unsupported model.'
+[[ -t 0 ]] || fail 'Run in an interactive terminal.'
+exec 9>/run/lock/macbookpro13-2-suspend-test.lock
+flock -n 9 || fail 'Another suspend test is running.'
+systemctl is-enabled --quiet macbookpro13-2-suspend.service || fail 'Installed suspend guard required.'
+sha256sum -c /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256
+/usr/local/lib/macbookpro13-2-omarchy/suspend-guard check
+[[ $(cat /sys/power/pm_trace) == 0 ]] || fail 'An existing PM trace experiment is active.'
+[[ $(cat /sys/power/pm_test) == *'[none]'* ]] || fail 'An existing PM test is active.'
+base=/var/lib/macbookpro13-2-omarchy/suspend-reports
+install -d -m 700 "$base"
+report=$(mktemp -d "$base/$(date -u +%Y%m%dT%H%M%SZ)-lid-XXXXXX")
+old_debug=$(cat /sys/power/pm_debug_messages)
+old_times=$(cat /sys/power/pm_print_times)
+ec_wakeup=/sys/bus/acpi/devices/PNP0C09:00/physical_node/power/wakeup
+old_ec=
+if [[ $ec_test == --ec-wake ]]; then
+    [[ -w $ec_wakeup ]] || fail 'Embedded-controller wake policy unavailable.'
+    old_ec=$(cat "$ec_wakeup")
+    [[ $old_ec == disabled ]] || fail 'EC wake is already enabled; no disabled/enabled comparison available.'
+    [[ $(cat /sys/module/acpi/parameters/ec_no_wakeup) == N ]] || fail 'Existing ec_no_wakeup policy prevents this comparison.'
+fi
+trace_root=/sys/kernel/tracing
+trace_instance=
+trace_group=mbp_lid_$$
+trace_events=()
+stop_trace() {
+    if [[ -n $trace_instance ]]; then
+        printf '0\n' > "$trace_instance/tracing_on"
+        cat "$trace_instance/trace" > "$report/lid-trace.txt"
+        for stats in "$trace_instance"/per_cpu/cpu*/stats; do
+            [[ ! -r $stats ]] || { printf '%s\n' "$stats"; cat "$stats"; }
+        done > "$report/trace-stats.txt"
+        printf '0\n' > "$trace_instance/events/enable"
+        rmdir -- "$trace_instance"
+        trace_instance=
+    fi
+    for event in "${trace_events[@]}"; do
+        printf '%s\n' "-:$trace_group/$event" >> "$trace_root/kprobe_events"
+    done
+    trace_events=()
+}
+restore() {
+    stop_trace || printf 'Trace cleanup incomplete; keep the report and reboot before another trace.\n' >&2
+    if [[ -n $old_ec ]]; then printf '%s\n' "$old_ec" > "$ec_wakeup"; fi
+    printf '%s\n' "$old_debug" > /sys/power/pm_debug_messages
+    printf '%s\n' "$old_times" > /sys/power/pm_print_times
+}
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trace_error() {
+    local status=$?
+    if [[ -n $trace_instance && -r $trace_root/error_log ]]; then
+        cat "$trace_root/error_log" > "$report/trace-setup-error.txt"
+        tail -n 15 "$report/trace-setup-error.txt" >&2
+    fi
+    return "$status"
+}
+trap trace_error ERR
+snapshot() {
+    cat /proc/acpi/wakeup
+    for id in PNP0C0D:00 PNP0C09:00; do
+        for field in wakeup wakeup_count wakeup_last_time_ms; do
+            path=/sys/bus/acpi/devices/$id/physical_node/power/$field
+            [[ ! -r $path ]] || { printf '%s/%s: ' "$id" "$field"; cat "$path"; }
+        done
+    done
+    cat /sys/module/acpi/parameters/ec_no_wakeup
+    cat /proc/acpi/button/lid/*/state
+}
+snapshot > "$report/before-wakeup.txt"
+if [[ $ec_test == --trace || $ec_test == --trace-check ]]; then
+    [[ $(uname -m) == x86_64 ]] || fail 'Trace argument formats require x86_64.'
+    [[ -w $trace_root/kprobe_events && -d $trace_root/instances ]] || fail 'Mounted tracefs with kprobes is required.'
+    for symbol in acpi_evaluate_object acpi_execute_simple_method acpi_lid_notify; do
+        rg -q " [tT] $symbol$" /proc/kallsyms || fail "Trace function unavailable: $symbol"
+    done
+    mkdir -- "$trace_root/instances/$trace_group"
+    trace_instance=$trace_root/instances/$trace_group
+    printf '0\n' > "$trace_instance/tracing_on"
+    printf '1024\n' > "$trace_instance/buffer_size_kb"
+    if rg -qw boot "$trace_instance/trace_clock"; then printf 'boot\n' > "$trace_instance/trace_clock"; fi
+    cat "$trace_instance/trace_clock" > "$report/trace-clock.txt"
+    # Named, owned kprobes only; leave other probes and global tracing untouched.
+    printf '%s\n' "p:$trace_group/evaluate acpi_evaluate_object handle=%di:x64 method=+0(%si):string" >> "$trace_root/kprobe_events"
+    trace_events+=(evaluate)
+    printf '%s\n' "p:$trace_group/simple acpi_execute_simple_method handle=%di:x64 method=+0(%si):string value=%dx:u64" >> "$trace_root/kprobe_events"
+    trace_events+=(simple)
+    printf '%s\n' "p:$trace_group/lid_notify acpi_lid_notify handle=%di:x64 event=%si:x32" >> "$trace_root/kprobe_events"
+    trace_events+=(lid_notify)
+    printf '%s\n' 'method == "_LID" || method == "_DSW" || method == "_PSW"' > "$trace_instance/events/$trace_group/evaluate/filter"
+    printf '%s\n' 'method == "_PSW"' > "$trace_instance/events/$trace_group/simple/filter"
+    printf '1\n' > "$trace_instance/events/$trace_group/enable"
+    if [[ -w $trace_instance/events/power/suspend_resume/enable ]]; then
+        printf '1\n' > "$trace_instance/events/power/suspend_resume/enable"
+    fi
+    printf '1\n' > "$trace_instance/tracing_on"
+    printf 'lid_trace_ready\n' > "$trace_instance/trace_marker"
+    # Reading lid state invokes _LID and validates argument decoding before sleep.
+    cat /proc/acpi/button/lid/*/state > "$report/trace-preflight-lid.txt"
+    cat "$trace_instance/trace" > "$report/trace-preflight.txt"
+    rg -q 'method="_LID"' "$report/trace-preflight.txt" || fail 'Probe registered but did not decode a lid-state evaluation; no sleep test requested.'
+    printf 'PASS: ACPI probe arguments decoded a live _LID read.\n'
+    if [[ $ec_test == --trace-check ]]; then
+        restore
+        trap - EXIT INT TERM ERR
+        cat "$report/trace-preflight.txt"
+        printf 'Trace setup checked and removed. No suspend requested. Private report: %s\n' "$report"
+        exit 0
+    fi
+    printf 'Isolated ACPI trace started; wake and sleep policy unchanged.\n'
+fi
+if [[ $ec_test == --ec-wake ]]; then
+    printf 'enabled\n' > "$ec_wakeup"
+    [[ $(cat "$ec_wakeup") == enabled ]] || fail 'EC wake setting did not take effect.'
+    printf 'Temporary EC wake enabled; original setting will be restored on exit.\n'
+fi
+printf '1\n' > /sys/power/pm_debug_messages
+printf '1\n' > /sys/power/pm_print_times
+started=$(date --iso-8601=seconds)
+printf 'Private report: %s\n' "$report"
+printf 'Save work; disconnect peripherals. Close the lid for about one minute, then open it.\n'
+printf 'Wait 15 seconds after opening. If it stays asleep, use one brief power-button press.\n'
+printf 'After the desktop returns, press Enter here to finish collecting logs.\n'
+printf 'No RTC alarm, persistent setting, driver reload or UKI change is requested.\n'
+read -r _
+if [[ -n $trace_instance ]]; then printf 'user_returned_to_terminal\n' > "$trace_instance/trace_marker"; fi
+snapshot > "$report/after-wakeup.txt"
+restore
+snapshot > "$report/restored-wakeup.txt"
+trap - EXIT INT TERM ERR
+journalctl --sync
+journalctl -b -k --since "$started" --no-pager > "$report/lid-kernel.log"
+journalctl -b -u systemd-logind -u macbookpro13-2-suspend.service --since "$started" --no-pager > "$report/lid-services.log"
+if [[ -f $report/lid-trace.txt ]]; then
+    printf 'ACPI wake/notification trace (last 45 events):\n'
+    tail -n 45 "$report/lid-trace.txt"
+fi
+printf 'Recent sleep/wake events:\n'
+rg 'PM:.*(entry|exit|wakeup|GPE|EC |suspend-to-idle)|Touchbar (suspended|resumed)|brcmf.*(Timeout|enter_D3)' "$report/lid-kernel.log" | tail -n 45 || true
+cat "$report/lid-services.log"
+printf 'Debug and any temporary EC wake settings restored. Private report: %s\n' "$report"
+printf 'Report whether lid opening or the power button woke it, and whether Wi-Fi/Touch Bar work.\n'

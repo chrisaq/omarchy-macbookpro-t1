@@ -28,8 +28,17 @@ if command -v apple-t1-touchbar-check >/dev/null; then
 else
     printf 'NOTE: Touch Bar package check unavailable; manual installation may be in use.\n'
 fi
+if command -v mbp13-2-wifi-resume-check >/dev/null; then
+    mbp13-2-wifi-resume-check --all || bad 'Wi-Fi resume DKMS check failed.'
+elif [[ -f /var/lib/macbookpro13-2-omarchy/wifi-resume-experiment.json ]]; then
+    printf 'NOTE: experimental Wi-Fi override is kernel-specific; migrate to the DKMS package.\n'
+fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 "$root/scripts/boot-integrity" || bad 'Boot verification failed or could not be read; run this check with sudo.'
 "$root/scripts/wifi" check --boot --if-installed || bad 'Wi-Fi candidate or early-boot verification failed.'
+if [[ -f /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256 ]]; then
+    sha256sum -c /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256 || bad 'Persistent suspend files changed.'
+    systemctl is-enabled --quiet macbookpro13-2-suspend.service || bad 'Suspend guard dependency is disabled.'
+fi
 [[ $errors -eq 0 ]] || exit 1
 printf 'PASS: installed builds. Repeat functional checks after booting the upgraded kernel.\n'

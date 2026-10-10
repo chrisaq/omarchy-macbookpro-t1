@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+pkgname=mbp13-2-brcmfmac-dkms
+pkgver=7.2.5.1
+pkgrel=1
+pkgdesc='Model-specific BCM43602 firmware reprobe on resume for MacBookPro13,2'
+arch=('x86_64')
+license=('ISC' 'GPL-2.0-only')
+depends=('dkms' 'gcc' 'make' 'binutils' 'python' 'kmod')
+optdepends=('linux-omarchy-headers: rebuild for Omarchy kernels'
+            'linux-headers: rebuild for Arch kernels'
+            'linux-lts-headers: rebuild for Arch LTS kernels')
+options=('!strip' '!debug')
+source=('driver-source.tar.gz' 'dkms.conf' 'check' 'boot-integrity' '99-mbp13-2-brcmfmac-check.hook' 'LICENSE')
+sha256sums=(__SOURCE_CHECKSUMS__)
+package() {
+    local target="$pkgdir/usr/src/mbp13-2-brcmfmac-$pkgver"
+    install -d "$target"
+    cp -R --no-preserve=ownership "$srcdir/driver-source/." "$target/"
+    install -m644 "$srcdir/dkms.conf" "$target/dkms.conf"
+    install -Dm755 "$srcdir/check" "$pkgdir/usr/bin/mbp13-2-wifi-resume-check"
+    install -Dm755 "$srcdir/boot-integrity" "$pkgdir/usr/lib/mbp13-2-wifi-resume/boot-integrity"
+    install -Dm644 "$srcdir/99-mbp13-2-brcmfmac-check.hook" "$pkgdir/usr/share/libalpm/hooks/99-mbp13-2-brcmfmac-check.hook"
+    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -d "$pkgdir/usr/share/mbp13-2-wifi-resume"
+    (cd "$pkgdir"; find usr/src/mbp13-2-brcmfmac-* usr/bin/mbp13-2-wifi-resume-check \
+        usr/lib/mbp13-2-wifi-resume usr/share/libalpm/hooks/99-mbp13-2-brcmfmac-check.hook \
+        -type f -print0 | sort -z | xargs -0 sha256sum) > "$pkgdir/usr/share/mbp13-2-wifi-resume/files.sha256"
+}

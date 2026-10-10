@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/src/mbp13-2-brcmfmac-*/dkms.conf
+Target = usr/lib/modules/*/modules.builtin
+Target = usr/lib/modules/*/build/Makefile
+
+[Action]
+Description = Verify MacBookPro13,2 Wi-Fi DKMS builds and boot integrity
+When = PostTransaction
+Exec = /usr/bin/mbp13-2-wifi-resume-check --all

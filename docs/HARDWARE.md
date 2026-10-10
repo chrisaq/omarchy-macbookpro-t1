@@ -1,13 +1,13 @@
 # Hardware compatibility
 
 Snapshot: MacBookPro13,2, Omarchy 4.0.4 / Quattro, kernel 7.2.5-3-omarchy,
-2026-10-09. “Working” reflects reported functional tests, not just driver loading.
+2026-10-10. “Working” reflects reported functional tests, not just driver loading.
 
 | Component | Status | Evidence / remaining test |
 | --- | --- | --- |
 | Built-in display | Working | Desktop usable |
 | Intel graphics | Seemingly working | Hyprland on i915; acceleration/load not separately tested |
-| Wi-Fi BCM43602 | Working | Initial connectivity worked; NVRAM test restored 5 GHz and improved reported link metrics; throughput untested; failed suspend abort leaves Wi-Fi unusable |
+| Wi-Fi BCM43602 | Working | Initial connectivity worked; NVRAM test restored 5 GHz and improved reported link metrics; throughput untested; patched resume passed repeated tests; DKMS migration verified, post-migration reboot/suspend confirmed Wi-Fi and Touch Bar |
 | Keyboard | Working | Normal typing |
 | Trackpad | Seemingly working | Normal desktop use; gestures/palm rejection untested |
 | Touch Bar Escape/F1–F12 | Working | Manual activation, service, clean shutdown and cold boot passed |
@@ -21,7 +21,7 @@ Snapshot: MacBookPro13,2, Omarchy 4.0.4 / Quattro, kernel 7.2.5-3-omarchy,
 | Temperatures | Detected | hwmon readings available; sensor accuracy/load behavior untested |
 | Fans | Untested | No control or load test; do not install speculative fan software |
 | Ambient light sensor | Untested | Optional driver available, not activated by Touch Bar service |
-| Suspend / resume | Failing | Wi-Fi D3 handshake aborts suspend; Touch Bar also remains off; see [SUSPEND.md](SUSPEND.md) |
+| Suspend / resume | Working with limitations | s2idle with Thunderbolt guard and Wi-Fi patch restored devices in repeated tests; lid opening needs power-button wake; long sleep/battery drain unverified; see [SUSPEND.md](SUSPEND.md) |
 | USB-C | Seemingly working | USB installer booted; port/data/charging combinations untested |
 | External displays / Thunderbolt | Untested | Real peripheral tests required |
 | Touch ID | No supported setup established | This guide provides no fingerprint driver |

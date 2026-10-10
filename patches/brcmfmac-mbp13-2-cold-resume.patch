@@ -1,0 +1,37 @@
+From: MacBookPro13,2 hardware investigation
+Subject: [EXPERIMENTAL] brcmfmac: use existing reprobe resume on MBP13,2 BCM43602
+
+Recorded hot resumes return success but leave firmware commands timing out.
+Existing reprobe resumes reinitialize firmware and have passed local tests.
+Test that path deterministically on the exact observed model and PCI IDs.
+Do not generalize this quirk until runtime testing establishes reliability.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -6,6 +6,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/firmware.h>
++#include <linux/dmi.h>
+ #include <linux/pci.h>
+ #include <linux/vmalloc.h>
+ #include <linux/delay.h>
+@@ -2676,6 +2677,18 @@
+ 	devinfo = bus->bus_priv.pcie->devinfo;
+ 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+ 
++	/* Experimental quirk: retain the existing full firmware reprobe path. */
++	if (bus->chip == BRCM_CC_43602_CHIP_ID &&
++	    devinfo->pdev->vendor == 0x14e4 &&
++	    devinfo->pdev->device == 0x43ba &&
++	    devinfo->pdev->subsystem_vendor == 0x106b &&
++	    devinfo->pdev->subsystem_device == 0x0157 &&
++	    dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
++	    dmi_match(DMI_PRODUCT_NAME, "MacBookPro13,2")) {
++		dev_info(dev, "MBP13,2 BCM43602: testing firmware reprobe on resume\n");
++		goto cleanup;
++	}
++
+ 	/* Check if device is still up and running, if so we are ready */
+ 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
+ 		brcmf_dbg(PCIE, "Try to wakeup device....\n");

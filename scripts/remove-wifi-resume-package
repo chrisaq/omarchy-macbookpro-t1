@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Remove only the Wi-Fi DKMS package and verify stock selection; no live reload."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+PACKAGE = 'mbp13-2-brcmfmac-dkms'
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 1:
+        raise RuntimeError('Usage: sudo scripts/remove-wifi-resume-package')
+    if Path('/sys/class/dmi/id/product_name').read_text().strip() != 'MacBookPro13,2':
+        raise RuntimeError('Unsupported model')
+    if Path('/var/lib/macbookpro13-2-omarchy/wifi-resume-experiment.json').exists():
+        raise RuntimeError('Experiment record still present; resolve incomplete migration first')
+    subprocess.run([str(ROOT/'scripts/boot-integrity')], check=True)
+    kernels = sorted(p.name for p in Path('/usr/lib/modules').iterdir() if (p/'kernel').is_dir())
+    installed = subprocess.run(['pacman','-Q',PACKAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if installed:
+        subprocess.run(['pacman','-R','--noconfirm',PACKAGE], check=True)
+    for kernel in kernels:
+        subprocess.run(['depmod',kernel],check=True)
+        module = subprocess.check_output(['modinfo','-k',kernel,'-n','brcmfmac'],text=True).strip()
+        if '/kernel/drivers/net/wireless/' not in module:
+            raise RuntimeError('Stock driver not selected for '+kernel+': '+module)
+        subprocess.run(['pacman','-Qo',module],check=True)
+        print('PASS: stock driver selected for '+kernel)
+    subprocess.run([str(ROOT/'scripts/boot-integrity')], check=True)
+    print('Stock driver restored on disk. No live reload. Reboot when ready; suspend Wi-Fi failures may return.')
+
+if __name__ == '__main__':
+    try:
+        import fcntl
+        with open('/run/lock/macbookpro13-2-wifi.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            main()
+    except (OSError,RuntimeError,subprocess.SubprocessError) as error:
+        print('STOP: '+str(error),file=sys.stderr)
+        sys.exit(1)

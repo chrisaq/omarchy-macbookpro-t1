@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Migrate an experiment or install reviewed DKMS source without reloading Wi-Fi."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+NAME = 'mbp13-2-brcmfmac'
+VERSION = '7.2.5.1'
+PACKAGE = 'mbp13-2-brcmfmac-dkms'
+STATE = Path('/var/lib/macbookpro13-2-omarchy/wifi-resume-experiment.json')
+
+def run(*args):
+    return subprocess.check_output(args, text=True).strip()
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2:
+        raise RuntimeError('Usage: sudo scripts/install-wifi-resume-package /path/to/package.pkg.tar.zst')
+    if Path('/sys/class/dmi/id/product_name').read_text().strip() != 'MacBookPro13,2':
+        raise RuntimeError('Unsupported model')
+    package = Path(sys.argv[1]).resolve()
+    expected = (package.parent / 'PACKAGE.sha256').read_text().strip().split()
+    if len(expected) != 2 or expected[1] != package.name or expected[0] != sha(package):
+        raise RuntimeError('Package checksum record mismatch')
+    if run('pacman', '-Qp', str(package)).split() != [PACKAGE, VERSION+'-1']:
+        raise RuntimeError('Unexpected package identity/version')
+    already_installed = subprocess.run(['pacman', '-Q', PACKAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if already_installed and run('pacman', '-Q', PACKAGE).split() != [PACKAGE, VERSION+'-1']:
+        raise RuntimeError('Another package version is installed; review migration first')
+    wifi = runpy.run_path(str(ROOT / 'scripts/wifi'))
+    wifi['boot_check']()
+    if wifi['inspect_initramfs']():
+        raise RuntimeError('Early Wi-Fi exists; review UKI integration before this migration')
+    kernels = sorted(p.name for p in Path('/usr/lib/modules').iterdir() if (p/'kernel').is_dir())
+    if not kernels:
+        raise RuntimeError('No installed kernels')
+    for kernel in kernels:
+        if not Path('/usr/lib/modules', kernel, 'build/include').is_dir():
+            raise RuntimeError('Install matching headers first: '+kernel)
+    pci = Path('/sys/bus/pci/devices/0000:02:00.0')
+    for field,value in {'vendor':'0x14e4','device':'0x43ba','subsystem_vendor':'0x106b','subsystem_device':'0x0157'}.items():
+        if (pci/field).read_text().strip() != value:
+            raise RuntimeError('Wi-Fi identity mismatch')
+    backup_base = Path('/var/lib/macbookpro13-2-omarchy/wifi-package-backups')
+    backup_base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup = Path(tempfile.mkdtemp(prefix='migration-', dir=backup_base))
+    os.chmod(backup, 0o700)
+    print('Migration backup: '+str(backup), flush=True)
+    # Preserve the reviewed archive so pacman does not read a changing user file.
+    root_package = backup/package.name
+    shutil.copyfile(package, root_package)
+    os.chmod(root_package, 0o600)
+    if sha(root_package) != expected[0]:
+        raise RuntimeError('Package changed while copying')
+    original = None
+    if STATE.exists():
+        record = json.loads(STATE.read_text())
+        original = Path('/usr/lib/modules') / record['kernel'] / 'updates/macbookpro13-2-wifi/brcmfmac.ko'
+        if record['target'] != str(original) or original.is_symlink() or sha(original) != record['module_sha256']:
+            raise RuntimeError('Existing experiment override changed; preserving it')
+        shutil.copyfile(STATE, backup/'experiment.json')
+        shutil.copyfile(original, backup/'brcmfmac.ko')
+    else:
+        for kernel in kernels:
+            if '/kernel/drivers/net/wireless/' not in run('modinfo','-k',kernel,'-n','brcmfmac'):
+                raise RuntimeError('Unrecognized brcmfmac override for '+kernel)
+    # Root-owned source trees are package-managed; never reuse a manual DKMS tree.
+    if Path('/usr/src',NAME+'-'+VERSION).exists() or Path('/var/lib/dkms',NAME,VERSION).exists():
+        if not already_installed or run('pacman','-Qqo',str(Path('/usr/src',NAME+'-'+VERSION,'dkms.conf'))) != PACKAGE:
+            raise RuntimeError('Existing DKMS source/state requires review')
+    try:
+        if original:
+            original.unlink()
+            run('depmod', record['kernel'])
+        subprocess.run(['pacman','-U','--noconfirm',str(root_package)], check=True)
+        # Hooks can finish a transaction despite a failed DKMS build: check explicitly.
+        for kernel in kernels:
+            state = run('dkms','status','-m',NAME,'-v',VERSION,'-k',kernel)
+            if ': installed' not in state:
+                subprocess.run(['dkms','install','-m',NAME,'-v',VERSION,'-k',kernel],check=True)
+        subprocess.run(['/usr/bin/mbp13-2-wifi-resume-check','--all'],check=True)
+        if original:
+            STATE.unlink()
+        wifi['boot_check']()
+        (backup/'SUCCESS').write_text('Installed and checked; no live driver reload.\n')
+    except Exception:
+        # Do not undo other packages or remove a partially installed package silently.
+        if original and (backup/'brcmfmac.ko').is_file() and not original.exists():
+            original.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(backup/'brcmfmac.ko',original)
+            os.chmod(original,0o644)
+            run('depmod',record['kernel'])
+        print('Migration incomplete. Original experiment restored when applicable; do not reboot until checks pass.',file=sys.stderr)
+        print('Backup retained: '+str(backup),file=sys.stderr)
+        raise
+    print('DKMS package installed and checked for all installed kernels.')
+    print('No live driver reload. Reboot when ready, then run sudo mbp13-2-wifi-resume-check --all.')
+    print('Stock rollback: sudo '+str(ROOT/'scripts/remove-wifi-resume-package'))
+
+if __name__ == '__main__':
+    try:
+        import fcntl
+        with open('/run/lock/macbookpro13-2-wifi.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            main()
+    except (OSError,RuntimeError,ValueError,KeyError,subprocess.SubprocessError) as error:
+        print('STOP: '+str(error),file=sys.stderr)
+        sys.exit(1)

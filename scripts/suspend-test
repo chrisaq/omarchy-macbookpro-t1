@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Explicit device-only or temporary s2idle test; never request deep sleep.
+set -euo pipefail
+fail() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+[[ $EUID == 0 ]] || fail 'Run with sudo.'
+[[ $(cat /sys/class/dmi/id/product_name) == MacBookPro13,2 ]] || fail 'Unsupported model.'
+[[ $# == 1 && ( $1 == collect || $1 == devices || $1 == s2idle || $1 == s2idle-no-d3cold || $1 == s2idle-tb-cycle || $1 == normal ) ]] || fail 'Usage: suspend-test collect|devices|s2idle|s2idle-no-d3cold|s2idle-tb-cycle|normal'
+mode=$1
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+base=/var/lib/macbookpro13-2-omarchy/suspend-reports
+install -d -m 700 "$base"
+report=$(mktemp -d "$base/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+printf 'Private report: %s\n' "$report"
+journalctl -b -1 -k --no-pager -o short-monotonic > "$report/previous-kernel.log" || true
+journalctl -b -1 -u systemd-suspend.service -u systemd-logind --no-pager > "$report/previous-sleep.log" || true
+"$root/scripts/suspend-status" > "$report/current-status.txt" 2>&1 || true
+for directory in /sys/fs/pstore /var/lib/systemd/pstore; do
+    [[ ! -d $directory ]] || cp -a "$directory" "$report/$(basename "$(dirname "$directory")")-pstore" || true
+done
+for field in pm_trace pm_trace_dev_match; do
+    [[ ! -r /sys/power/$field ]] || cat "/sys/power/$field" > "$report/$field.txt"
+done
+printf 'Last previous-boot PM events:\n'
+rg 'PM:.*(suspend|failed|Some devices|Magic number)|hash matches|Touchbar (suspended|resumed)|brcmf.*enter_D3' "$report/previous-kernel.log" | tail -n 12 || true
+if [[ $mode == collect ]]; then
+    printf 'Collected only. No device, sleep or boot settings changed. Raw reports are private.\n'
+    exit 0
+fi
+exec 9>/run/lock/macbookpro13-2-suspend-test.lock
+flock -n 9 || fail 'Another test is running.'
+[[ -w /sys/power/pm_test ]] || fail 'Kernel device-only PM testing unavailable.'
+rg -qw devices /sys/power/pm_test || fail 'Kernel does not support devices test.'
+old_test=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/power/pm_test)
+[[ $old_test == none ]] || fail 'A different PM test is already selected.'
+old_debug=$(cat /sys/power/pm_debug_messages)
+old_times=$(cat /sys/power/pm_print_times)
+old_mem=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/power/mem_sleep)
+sleep_override=/run/systemd/sleep.conf.d/zzzz-macbookpro13-2-test.conf
+override_owned=0
+alarm_owned=0
+if [[ $mode != devices ]]; then
+    command -v rtcwake >/dev/null || fail 'rtcwake is required for a timed wake alarm.'
+    rg -qw s2idle /sys/power/mem_sleep || fail 's2idle is not available.'
+    [[ ! -e $sleep_override && ! -L $sleep_override ]] || fail 'Test sleep override already exists; inspect it first.'
+    [[ $(cat /sys/power/pm_trace) == 0 ]] || fail 'Disable an existing PM trace experiment before using an RTC alarm.'
+    [[ -w /sys/class/rtc/rtc0/wakealarm ]] || fail 'RTC wake alarm unavailable.'
+    old_alarm=$(cat /sys/class/rtc/rtc0/wakealarm)
+    [[ -z $old_alarm || $old_alarm == 0 ]] || fail 'An RTC alarm is already armed; preserving it.'
+fi
+if [[ $mode == normal ]]; then
+    systemctl is-enabled --quiet macbookpro13-2-suspend.service || fail 'Normal test requires the installed Thunderbolt guard.'
+    sha256sum -c /var/lib/macbookpro13-2-omarchy/suspend-installed.sha256 || fail 'Installed suspend files changed.'
+    /usr/local/lib/macbookpro13-2-omarchy/suspend-guard check
+fi
+pci_paths=()
+pci_values=()
+tb_removed=0
+if [[ $mode == s2idle-no-d3cold || $mode == s2idle-tb-cycle ]]; then
+    # Internal Alpine Ridge topology observed on this exact model. Never remove
+    # or rebind devices, and refuse a faulted/missing controller after resume.
+    specs=(00:1c.4:9d14 00:1d.0:9d18 03:00.0:1578
+           04:00.0:15d3 04:01.0:15d3 04:02.0:15d3 04:04.0:15d3
+           05:00.0:15d2 06:00.0:15d4 79:00.0:1578
+           7a:00.0:15d3 7a:01.0:15d3 7a:02.0:15d3 7a:04.0:15d3
+           7b:00.0:15d2 7c:00.0:15d4)
+    for spec in "${specs[@]}"; do
+        address=${spec%:*}
+        expected=${spec##*:}
+        path="/sys/bus/pci/devices/0000:$address"
+        [[ -r $path/vendor && -r $path/device && -w $path/d3cold_allowed ]] || fail "Controller missing: $address. Reboot to restore controllers before this test."
+        [[ $(cat "$path/vendor") == 0x8086 && $(cat "$path/device") == "0x$expected" ]] || fail "Unexpected PCI device: $address"
+    done
+    # Verify controller ancestry too: an address/ID list alone does not prove
+    # these roots are the Thunderbolt trees on this machine.
+    left=$(readlink -f /sys/bus/pci/devices/0000:03:00.0)
+    right=$(readlink -f /sys/bus/pci/devices/0000:79:00.0)
+    [[ $left == */0000:00:1c.4/0000:03:00.0 && $right == */0000:00:1d.0/0000:79:00.0 ]] || fail 'Unexpected Thunderbolt controller ancestry; inspect topology before testing.'
+    # Reject additional PCI endpoints below these roots (external PCI tunnels).
+    for path in /sys/bus/pci/devices/*; do
+        resolved=$(readlink -f "$path")
+        case "$resolved" in
+            */0000:00:1c.4/*|*/0000:00:1d.0/*)
+                known=0
+                for spec in "${specs[@]}"; do [[ ${path##*/} != "0000:${spec%:*}" ]] || known=1; done
+                [[ $known == 1 ]] || fail "External/unexpected PCI endpoint ${path##*/} in Thunderbolt tree; disconnect peripherals first."
+                ;;
+        esac
+    done
+fi
+if [[ $mode == s2idle-tb-cycle ]]; then
+    for path in /sys/class/block/* /sys/bus/usb/devices/*; do
+        [[ -e $path ]] || continue
+        resolved=$(readlink -f "$path")
+        case "$resolved" in
+            */0000:03:00.0/*|*/0000:79:00.0/*)
+                if [[ $path == /sys/class/block/* ]]; then
+                    fail 'A block device is attached under Thunderbolt; disconnect storage before this test.'
+                fi
+                # USB root hubs/interfaces are internal; any attached device
+                # with a physical nonzero port is a peripheral, even unmounted.
+                if [[ ${path##*/} =~ ^[0-9]+-[1-9] ]]; then
+                    fail 'A USB peripheral is attached under Thunderbolt; disconnect it before this test.'
+                fi
+                ;;
+        esac
+    done
+    for address in 0000:00:1c.4 0000:00:1d.0; do
+        [[ -w /sys/bus/pci/devices/$address/rescan ]] || fail 'Root-port rescan unavailable.'
+    done
+fi
+rescan_tb() {
+    local pass address
+    # Rescan these root ports only: never the Wi-Fi or NVMe endpoint.
+    for pass in 1 2; do
+        for address in 0000:00:1c.4 0000:00:1d.0; do
+            printf '1\n' > "/sys/bus/pci/devices/$address/rescan" || return 1
+        done
+        sleep 1
+    done
+    tb_removed=0
+}
+restore() {
+    printf '%s\n' "$old_test" > /sys/power/pm_test
+    printf '%s\n' "$old_debug" > /sys/power/pm_debug_messages
+    printf '%s\n' "$old_times" > /sys/power/pm_print_times
+    if [[ $override_owned == 1 ]]; then rm -- "$sleep_override"; fi
+    if [[ $alarm_owned == 1 ]]; then printf '0\n' > /sys/class/rtc/rtc0/wakealarm; fi
+    printf '%s\n' "$old_mem" > /sys/power/mem_sleep
+    if [[ $tb_removed == 1 ]]; then
+        printf 'Rescanning the two Thunderbolt root ports to restore controllers.\n'
+        rescan_tb || printf 'ERROR: rescan failed; reboot to recover controllers.\n' >&2
+    fi
+    for index in "${!pci_paths[@]}"; do
+        [[ ! -w ${pci_paths[$index]} ]] || printf '%s\n' "${pci_values[$index]}" > "${pci_paths[$index]}"
+    done
+}
+trap restore EXIT
+if [[ $mode == s2idle-no-d3cold ]]; then
+    for spec in "${specs[@]}"; do
+        path="/sys/bus/pci/devices/0000:${spec%:*}/d3cold_allowed"
+        pci_paths+=("$path")
+        pci_values+=("$(cat "$path")")
+        printf '0\n' > "$path"
+    done
+    printf 'Temporary D3cold prohibition applied only to both internal Thunderbolt trees.\n'
+fi
+printf '1\n' > /sys/power/pm_debug_messages
+printf '1\n' > /sys/power/pm_print_times
+if [[ $mode == devices ]]; then
+    printf 'devices\n' > /sys/power/pm_test
+    printf 'Device-only test: callbacks run, then the kernel should resume automatically after its test delay.\n'
+    printf 'Save work first. A broken driver callback can still hang this test. Keep the lid open.\n'
+else
+    mkdir -p -- "$(dirname -- "$sleep_override")"
+    (set -o noclobber; printf '[Sleep]\nSuspendState=mem\nMemorySleepMode=s2idle\n' > "$sleep_override")
+    override_owned=1
+    printf 's2idle\n' > /sys/power/mem_sleep
+    printf 'Real s2idle test; an approximately 20-second RTC alarm will be armed before sleep. Keep the lid open.\n'
+    printf 'Save work first; a kernel/firmware failure can still prevent wake.\n'
+fi
+if [[ $mode == s2idle-tb-cycle ]]; then
+    printf 'Only the internal Thunderbolt subtrees will be removed/rescanned for this test; Wi-Fi/NVMe/T1 are excluded.\n'
+elif [[ $mode == normal ]]; then
+    printf 'Normal logind/NetworkManager sleep path; the installed guard handles Thunderbolt removal/restoration.\n'
+else
+    printf 'No driver reload or PCI removal is requested.\n'
+fi
+printf 'No persistent sleep configuration or UKI change is requested.\n' 
+if [[ $mode == s2idle-tb-cycle ]]; then
+    printf 'Temporarily removing the two verified, peripheral-free Thunderbolt subtrees.\n'
+    tb_removed=1
+    printf '1\n' > /sys/bus/pci/devices/0000:03:00.0/remove
+    printf '1\n' > /sys/bus/pci/devices/0000:79:00.0/remove
+    [[ ! -e /sys/bus/pci/devices/0000:03:00.0 && ! -e /sys/bus/pci/devices/0000:79:00.0 ]] || fail 'Thunderbolt subtree removal incomplete; restoring without suspend.'
+fi
+if [[ $mode != devices ]]; then
+    alarm_owned=1
+    rtcwake --device /dev/rtc0 --mode no --seconds 20
+fi
+test_start=$(date --iso-8601=seconds)
+printf '%s\n' "$mode" > "$report/test-mode.txt"
+journalctl --sync
+sync
+# Wait for the actual oneshot to finish; systemctl suspend may enqueue and return.
+result=0
+if [[ $mode == normal ]]; then
+    prior_start=$(systemctl show systemd-suspend.service -p ExecMainStartTimestampMonotonic --value)
+    systemctl suspend || result=$?
+    # The normal command can return after enqueueing. Observe a new sleep-service
+    # invocation and its completion without starting a second suspend transaction.
+    completed=0
+    if [[ $result == 0 ]]; then
+        for ((attempt=0; attempt<120; attempt++)); do
+            current_start=$(systemctl show systemd-suspend.service -p ExecMainStartTimestampMonotonic --value)
+            state=$(systemctl show systemd-suspend.service -p ActiveState --value)
+            if [[ $current_start != "$prior_start" && $state == inactive ]] &&
+               ! systemctl is-active --quiet macbookpro13-2-suspend.service; then
+                completed=1
+                break
+            fi
+            if [[ $state == failed ]]; then result=1; break; fi
+            sleep 1
+        done
+        if [[ $completed == 0 ]]; then
+            printf 'Normal suspend completion was not confirmed; inspect the private service report.\n' >&2
+            result=1
+        fi
+    fi
+else
+    systemctl start --wait systemd-suspend.service || result=$?
+fi
+restore
+trap - EXIT
+journalctl --sync
+journalctl -b -k --since "$test_start" --no-pager -o short-monotonic > "$report/after-kernel.log"
+"$root/scripts/suspend-status" > "$report/after-status.txt" 2>&1 || true
+journalctl -b --since "$test_start" -u NetworkManager -u systemd-logind -u systemd-suspend.service -u macbookpro13-2-suspend.service --no-pager > "$report/after-services.log"
+printf 'Test command exit status: %s\n' "$result"
+printf 'Recent PM/driver events:\n'
+rg 'PM:.*(entry|exit|noirq.*complete|suspend-to-idle|wakeup)|Touchbar (suspended|resumed)|brcmf|Firmware: BCM|not ready|device inaccessible' "$report/after-kernel.log" | tail -n 55 || true
+printf 'Runtime PM debug/test settings restored. Reports: %s\n' "$report"
+if [[ $mode == s2idle-tb-cycle ]]; then
+    missing=0
+    printf 'Controller restoration check:\n'
+    for spec in "${specs[@]}"; do
+        path="/sys/bus/pci/devices/0000:${spec%:*}"
+        if [[ -r $path/vendor && -r $path/device && $(cat "$path/vendor") == 0x8086 && $(cat "$path/device") == "0x${spec##*:}" ]]; then
+            printf '%s: present, expected ID\n' "${spec%:*}"
+        else
+            printf '%s: MISSING or unexpected ID\n' "${spec%:*}"
+            missing=1
+        fi
+    done
+    for pair in 05:00.0:thunderbolt 06:00.0:xhci_hcd 7b:00.0:thunderbolt 7c:00.0:xhci_hcd; do
+        address=${pair%:*}
+        expected=${pair##*:}
+        driver=$(basename -- "$(readlink -f "/sys/bus/pci/devices/0000:$address/driver")")
+        printf '%s driver: %s\n' "$address" "$driver"
+        [[ $driver == "$expected" ]] || missing=1
+    done
+    [[ $missing == 0 ]] || result=1
+fi
+printf 'Now check Wi-Fi, Touch Bar and normal desktop responsiveness.\n' 
+exit "$result"

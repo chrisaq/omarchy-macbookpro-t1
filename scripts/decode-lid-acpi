@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Disassemble captured AML as data. Do not execute or load firmware methods.
+set -euo pipefail
+[[ $EUID != 0 && $# == 1 ]] || { echo 'Usage: scripts/decode-lid-acpi /path/to/private/capture (without sudo)' >&2; exit 1; }
+command -v iasl >/dev/null || { echo 'iasl missing; install the acpica package first.' >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+capture=$(realpath -- "$1")
+[[ $capture == "$root/reports/"* && -f $capture/DSDT.aml ]] || { echo 'Expected an ACPI capture under this checkout reports directory.' >&2; exit 1; }
+cd -- "$capture"
+[[ ! -e DSDT.dsl ]] || { echo 'Existing DSDT.dsl preserved; inspect it instead.' >&2; exit 1; }
+# SSDTs supply external method declarations needed by the DSDT disassembler.
+shopt -s nullglob
+ssdt=(SSDT*.aml)
+umask 077
+if (( ${#ssdt[@]} )); then
+    iasl -e "${ssdt[@]}" -d DSDT.aml > decode.log 2>&1
+else
+    iasl -d DSDT.aml > decode.log 2>&1
+fi
+printf 'Offline decode: %s/DSDT.dsl\n' "$capture"
+printf 'No ACPI method execution, table loading or system configuration change.\n'

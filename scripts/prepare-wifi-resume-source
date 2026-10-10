@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Fetch the reviewed historical recipe; do not execute PKGBUILD or install.
+set -euo pipefail
+[[ $EUID != 0 && $# == 0 ]] || { echo 'Run scripts/prepare-wifi-resume-source without sudo.' >&2; exit 1; }
+[[ $(uname -r) == 7.2.5-3-omarchy ]] || { echo 'This experimental source recipe is pinned to 7.2.5-3-omarchy.' >&2; exit 1; }
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+commit=7b11c97603dd9d751d803746560ee51640709725
+stage=$root/build/wifi-resume-recipe
+[[ ! -e $stage ]] || { echo "Existing staging preserved: $stage" >&2; exit 1; }
+mkdir -p "$root/build"
+checkout=$(mktemp -d "$root/build/wifi-recipe-fetch-XXXXXXXX")
+trap 'rm -rf -- "$checkout"' EXIT
+git -C "$checkout" init -q
+git -C "$checkout" remote add origin https://github.com/omacom/omarchy-pkgs.git
+git -C "$checkout" fetch --depth=1 origin "$commit"
+[[ $(git -C "$checkout" rev-parse FETCH_HEAD) == "$commit" ]]
+mkdir "$stage"
+git -C "$checkout" archive "$commit" pkgbuilds/linux-omarchy | tar -x -C "$stage" --strip-components=2
+rg -qx 'pkgver=7.2.5' "$stage/PKGBUILD"
+rg -qx 'pkgrel=3' "$stage/PKGBUILD"
+printf '%s\n' "$commit" > "$stage/UPSTREAM-COMMIT"
+printf 'Pinned historical kernel recipe: %s\n' "$stage"
+printf 'Fetched for review only. PKGBUILD was not executed; no build, install, driver reload or reboot occurred.\n'

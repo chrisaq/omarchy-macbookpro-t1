@@ -83,6 +83,23 @@ manual activation and cold-boot checkpoints before enabling automatic activation
 The URL is the intended public repository; it was not publicly retrievable during
 preparation of this guide. Until published, use the local sibling checkout.
 
+## Set up and verify suspend
+
+After clean shutdown and cold boot work, follow the
+[suspend guard installation](SUSPEND.md#persistent-configuration-and-lid-testing).
+It configures s2idle and removes/restores only the verified internal Thunderbolt
+subtrees. Suspend with peripherals disconnected; deep sleep previously hung.
+
+Follow [WIFI-RESUME.md](WIFI-RESUME.md) to build and install the Wi-Fi resume DKMS
+package. It includes fresh installation, migration from the temporary override,
+post-reboot tests, upgrade checks and scripted stock rollback. Keep matching
+headers installed. Only kernel 7.2.5-3-omarchy has been tested; a future build
+failure must be resolved before booting that kernel.
+
+The combined setup restored Wi-Fi, Touch Bar and trackpad in repeated tests.
+Opening the lid still did not wake this machine; use a brief power-button press.
+Long sleep, battery drain and suspend with attached peripherals remain unverified.
+
 ## Validate before further customization
 
 Use VERIFY.md and record what actually works. Verify clean shutdown and cold boot

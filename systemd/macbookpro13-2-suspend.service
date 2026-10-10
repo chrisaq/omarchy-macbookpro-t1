@@ -1,0 +1,17 @@
+[Unit]
+Description=Guard and restore MacBookPro13,2 Thunderbolt for suspend
+DefaultDependencies=no
+Before=systemd-suspend.service
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/macbookpro13-2-omarchy/suspend-guard prepare
+ExecStop=/usr/local/lib/macbookpro13-2-omarchy/suspend-guard restore
+ExecStopPost=/usr/local/lib/macbookpro13-2-omarchy/suspend-guard restore
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+RequiredBy=systemd-suspend.service

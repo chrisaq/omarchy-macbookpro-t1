@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Install/check/remove a current-kernel-only experimental brcmfmac override."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+RELEASE = '7.2.5-3-omarchy'
+TARGET = Path('/usr/lib/modules') / RELEASE / 'updates/macbookpro13-2-wifi/brcmfmac.ko'
+STATE = Path('/var/lib/macbookpro13-2-omarchy/wifi-resume-experiment.json')
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def run(*args):
+    return subprocess.check_output(args, text=True).strip()
+
+def atomic(path, data, mode):
+    tmp = path.with_name(path.name + '.new-' + str(os.getpid()))
+    with tmp.open('xb') as stream:
+        os.chmod(tmp, mode)
+        stream.write(data)
+    tmp.replace(path)
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2 or sys.argv[1] not in ('install', 'check', 'rollback'):
+        raise RuntimeError('Usage: sudo scripts/wifi-resume-experiment install|check|rollback')
+    if Path('/sys/class/dmi/id/product_name').read_text().strip() != 'MacBookPro13,2':
+        raise RuntimeError('Unsupported model')
+    action = sys.argv[1]
+    wifi = runpy.run_path(str(ROOT / 'scripts/wifi'))
+    wifi['boot_check']()
+    if action == 'install':
+        if os.uname().release != RELEASE:
+            raise RuntimeError('Candidate only supports ' + RELEASE)
+        if STATE.exists() or STATE.is_symlink() or TARGET.exists() or TARGET.is_symlink():
+            raise RuntimeError('Existing experiment preserved; check/rollback first')
+        pci = Path('/sys/bus/pci/devices/0000:02:00.0')
+        for field, expected in {'vendor':'0x14e4', 'device':'0x43ba', 'subsystem_vendor':'0x106b', 'subsystem_device':'0x0157'}.items():
+            if (pci / field).read_text().strip() != expected:
+                raise RuntimeError('Wi-Fi PCI identity mismatch')
+        if wifi['inspect_initramfs']():
+            raise RuntimeError('Early Wi-Fi exists; this experimental installer will not change the UKI')
+        lockdown = Path('/sys/kernel/security/lockdown')
+        if lockdown.exists() and '[none]' not in lockdown.read_text():
+            raise RuntimeError('Kernel lockdown requires a separately signed candidate')
+        enforce = Path('/sys/module/module/parameters/sig_enforce')
+        if enforce.exists() and enforce.read_text().strip() in ('Y', '1'):
+            raise RuntimeError('Module signature enforcement is enabled')
+        stock = Path(run('modinfo', '-k', RELEASE, '-n', 'brcmfmac'))
+        if '/kernel/drivers/net/wireless/' not in str(stock):
+            raise RuntimeError('Existing non-stock module override; inspect first')
+        run('pacman', '-Qo', str(stock))
+        stage = ROOT / 'build/wifi-resume-candidate'
+        record = json.loads((stage / 'BUILD-RECORD.json').read_text())
+        module = stage / 'drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko'
+        data = module.read_bytes()
+        if record['kernel'] != RELEASE or record['module_sha256'] != sha(data):
+            raise RuntimeError('Candidate build record/module mismatch')
+        if record['patch_sha256'] != sha((ROOT / 'patches/brcmfmac-mbp13-2-cold-resume.patch').read_bytes()):
+            raise RuntimeError('Patch changed since build')
+        if record['module_symvers_sha256'] != sha((Path('/usr/lib/modules') / RELEASE / 'build/Module.symvers').read_bytes()):
+            raise RuntimeError('Headers changed since build')
+        if run('modinfo', '-F', 'vermagic', str(module)).split()[0] != RELEASE:
+            raise RuntimeError('Candidate vermagic mismatch')
+        record.update(target=str(TARGET), stock=str(stock), stock_sha256=sha(stock.read_bytes()),
+                      srcversion=run('modinfo', '-F', 'srcversion', str(module)))
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        TARGET.parent.mkdir(parents=True, exist_ok=True)
+        atomic(STATE, (json.dumps(record, indent=2) + '\n').encode(), 0o600)
+        try:
+            atomic(TARGET, data, 0o644)
+            run('depmod', RELEASE)
+            if Path(run('modinfo', '-k', RELEASE, '-n', 'brcmfmac')).resolve() != TARGET.resolve():
+                raise RuntimeError('depmod did not select the candidate')
+            wifi['boot_check']()
+        except Exception:
+            if TARGET.is_file() and sha(TARGET.read_bytes()) == record['module_sha256']:
+                TARGET.unlink()
+            run('depmod', RELEASE)
+            STATE.unlink()
+            raise
+        print('Installed experimental override for ' + RELEASE + '; stock module preserved.')
+        print('No live driver reload or UKI change. Reboot to test; save rollback locally.')
+        print('Rollback: sudo ' + str(Path(__file__).resolve()) + ' rollback')
+        print('Not upgrade-persistent: validate before designing DKMS/upgrade support.')
+    else:
+        if not STATE.is_file():
+            raise RuntimeError('No experiment installation record')
+        record = json.loads(STATE.read_text())
+        if record['kernel'] != RELEASE or record['target'] != str(TARGET):
+            raise RuntimeError('Unexpected installation record')
+        if TARGET.is_symlink() or (TARGET.exists() and (not TARGET.is_file() or sha(TARGET.read_bytes()) != record['module_sha256'])):
+            raise RuntimeError('Installed candidate changed; refusing mutation')
+        if not TARGET.exists() and action != 'rollback':
+            raise RuntimeError('Installed candidate missing; inspect or retry rollback')
+        stock = Path(record['stock'])
+        if sha(stock.read_bytes()) != record['stock_sha256']:
+            raise RuntimeError('Stock module changed; inspect before rollback/check')
+        if action == 'rollback':
+            if TARGET.exists():
+                TARGET.unlink()
+            run('depmod', RELEASE)
+            if Path(run('modinfo', '-k', RELEASE, '-n', 'brcmfmac')).resolve() != stock.resolve():
+                raise RuntimeError('Stock resolution failed; record retained for inspection')
+            STATE.unlink()
+            wifi['boot_check']()
+            print('Removed only recorded override; stock module selected. Reboot to load stock.')
+            print('No live driver reload or UKI change occurred.')
+        else:
+            if Path(run('modinfo', '-k', RELEASE, '-n', 'brcmfmac')).resolve() != TARGET.resolve():
+                raise RuntimeError('Candidate is not selected on disk')
+            loaded = Path('/sys/module/brcmfmac/srcversion').read_text().strip()
+            print('PASS: installed candidate and stock checksums match.')
+            print('Running module: ' + ('candidate' if loaded == record['srcversion'] else 'other (reboot needed)'))
+            print('Connectivity and suspend still require functional testing.')
+
+if __name__ == '__main__':
+    try:
+        with open('/run/lock/macbookpro13-2-wifi.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            main()
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print('STOP: ' + str(error), file=sys.stderr)
+        sys.exit(1)

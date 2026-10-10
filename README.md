@@ -13,7 +13,7 @@ record: a detected device is not automatically a working device.
 | Kernel / headers | `7.2.5-3-omarchy` / `linux-omarchy-headers 7.2.5-3` |
 | DKMS | 3.4.3 |
 | Boot | Limine UKI · encrypted Btrfs root |
-| Validation date | 2026-10-09 |
+| Validation date | 2026-10-10 |
 
 Display, normal keyboard use, Wi-Fi connectivity and built-in speaker playback
 were tested. Escape/F-keys, automatic Touch Bar activation, clean shutdown and
@@ -28,13 +28,14 @@ cold boot were also confirmed. Other functionality is listed individually in
    for the Touch Bar. Its driver, package, service and recovery guide live there.
 4. Use the [scripted Wi-Fi setup](docs/WIFI.md) if reception is unexpectedly weak.
    It pins the tested candidate and asks for this machine's original Wi-Fi MAC.
-5. [Test hardware and record observations](docs/VERIFY.md).
-6. [Check upgrades and recovery](docs/UPGRADES.md).
+5. For suspend, install and test the [Thunderbolt suspend guard](docs/SUSPEND.md#persistent-configuration-and-lid-testing) and the [Wi-Fi resume DKMS package](docs/WIFI-RESUME.md). Lid opening still requires a brief power-button press on the tested machine.
+6. [Test hardware and record observations](docs/VERIFY.md).
+7. [Check upgrades and recovery](docs/UPGRADES.md).
 
 No all-in-one script repartitions disks, installs drivers or reboots. Read-only
 checks and active tests are separate, and installation commands must be invoked
-explicitly. The scripts do not replace working Wi-Fi/input drivers or change
-power-management settings.
+explicitly. The optional Wi-Fi resume package replaces the selected Wi-Fi module, and the
+suspend installer explicitly configures s2idle and the Thunderbolt guard.
 
 ## Check this machine
 
@@ -70,8 +71,10 @@ A recorded pass is a user observation, not independent automated certification.
 | `scripts/test-audio`, `test-webcam` | Explicit playback, recording and live-video tests |
 | `scripts/prepare-audio`, `install-audio` | Pinned upstream audio source and fresh installation |
 | `scripts/wifi`, `packaging/` | Pinned Wi-Fi candidate preparation, install/adopt, rollback and upgrade validation |
+| `scripts/install-suspend`, `suspend-guard`, `disable-suspend` | Guarded s2idle/Thunderbolt persistence and rollback; see SUSPEND.md |
 | `scripts/boot-integrity` | UKI hash checking and backed-up Limine rebuild |
-| `patches/` | Small audio DKMS target-kernel/pre-build patch |
+| `scripts/build-wifi-resume-package`, `install-wifi-resume-package`, `remove-wifi-resume-package` | Source-only Wi-Fi resume DKMS package, migration and stock rollback |
+| `patches/` | Audio build and model-specific Broadcom resume patches |
 | `tests/` | Result classification and audio pre-build failure checks |
 
 See [the installation record](docs/INSTALLATION-RECORD.md) for the actual historical
@@ -82,3 +85,5 @@ fetched from its pinned upstream revision, and no Apple firmware is distributed.
 Boot checksum warnings and scripted repair: [BOOT-INTEGRITY.md](docs/BOOT-INTEGRITY.md).
 
 Known lid/suspend failure and staged Touch Bar callback repair: [SUSPEND.md](docs/SUSPEND.md).
+
+Wi-Fi suspend firmware reprobe now has a [DKMS package, migration and rollback guide](docs/WIFI-RESUME.md). Kernel upgrades require matching headers and successful checks before reboot.
